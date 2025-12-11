@@ -54,6 +54,8 @@ class Uploader:
                        properties: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Upload scanned document to API.
         
+        Strategy: Create document with first page, then append remaining pages one by one.
+        
         Args:
             image_files: List of image file paths to upload
             doc_id: Optional document ID (will be generated if not provided)
@@ -73,22 +75,70 @@ class Uploader:
         if not image_files:
             raise UploadError("No files to upload")
         
-        # Generate document ID if not provided
-        if doc_id is None:
-            # Simple doc ID generation
-            import hashlib
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y-%m-%d-%H:%M")
-            hash_input = timestamp + str(os.urandom(4).hex())
-            hash_obj = hashlib.md5(hash_input.encode())
-            hash_digits = hash_obj.hexdigest()[:5].upper()
-            doc_id = f"{timestamp}-{hash_digits}"
+        self.logger.info(f"Uploading {len(image_files)} pages incrementally")
         
+        # Step 1: Create document with first page
+        first_page = image_files[0]
+        self.logger.info(f"Creating document with first page: {first_page}")
+        
+        result = self._create_document(
+            [first_page],
+            doc_id=doc_id,
+            metadata=metadata,
+            document_type=document_type,
+            properties=properties
+        )
+        
+        # Extract document ID from response
+        created_doc_id = result.get('doc_id')
+        if not created_doc_id:
+            raise UploadError("Failed to get document ID from create response")
+        
+        self.logger.info(f"Document created with ID: {created_doc_id}")
+        
+        total_pages_added = result.get('pages_added', 1)
+        
+        # Step 2: Append remaining pages one by one
+        if len(image_files) > 1:
+            for i, page_file in enumerate(image_files[1:], start=2):
+                self.logger.info(f"Appending page {i}/{len(image_files)}: {page_file}")
+                
+                append_result = self._append_pages(created_doc_id, [page_file])
+                total_pages_added += append_result.get('pages_added', 1)
+                
+                self.logger.info(f"Page {i} appended successfully. Total pages: {append_result.get('total_pages', total_pages_added)}")
+        
+        # Return final result
+        return {
+            'success': True,
+            'response': result.get('response'),
+            'doc_id': created_doc_id,
+            'pages_added': total_pages_added,
+            'total_pages': total_pages_added
+        }
+    
+    def _create_document(self, image_files: List[str], doc_id: Optional[str] = None,
+                        metadata: Optional[Dict[str, Any]] = None,
+                        document_type: Optional[str] = None,
+                        properties: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Create a new document with initial page(s).
+        
+        Args:
+            image_files: List of image file paths to upload
+            doc_id: Optional document ID (will be generated if not provided)
+            metadata: Optional document metadata
+            document_type: Optional document type ID
+            properties: Optional document properties
+            
+        Returns:
+            Dictionary with upload result
+            
+        Raises:
+            UploadError: If upload fails
+        """
         # Build API URL
         # Format: {base_url}/{workspace}/api/document/
         api_url = f"{self.config.api_url}/{self.config.api_workspace}/api/document/"
-        
-        self.logger.info(f"Uploading {len(image_files)} files to {api_url}")
         
         # Prepare files for multipart upload
         files = []
@@ -135,11 +185,11 @@ class Uploader:
             if response.status_code in [200, 201]:
                 try:
                     result = response.json()
-                    self.logger.info(f"Upload successful: {result}")
+                    self.logger.info(f"Document created successfully: {result}")
                     return {
                         'success': True,
                         'response': result,
-                        'doc_id': result.get('docId', doc_id),
+                        'doc_id': result.get('docId'),
                         'pages_added': result.get('pagesAdded', len(image_files)),
                         'total_pages': result.get('totalPages', len(image_files))
                     }
@@ -154,12 +204,106 @@ class Uploader:
                     }
             else:
                 error_msg = f"HTTP {response.status_code}: {response.text}"
-                self.logger.error(f"Upload failed: {error_msg}")
+                self.logger.error(f"Document creation failed: {error_msg}")
                 raise UploadError(error_msg)
                 
         except Exception as e:
-            self.logger.error(f"Upload error: {e}")
-            raise UploadError(f"Upload error: {e}")
+            self.logger.error(f"Document creation error: {e}")
+            raise UploadError(f"Document creation error: {e}")
+    
+    def _append_pages(self, doc_id: str, image_files: List[str],
+                     metadata: Optional[Dict[str, Any]] = None,
+                     document_type: Optional[str] = None,
+                     properties: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Append page(s) to an existing document.
+        
+        Args:
+            doc_id: Document ID to append pages to
+            image_files: List of image file paths to upload
+            metadata: Optional document metadata
+            document_type: Optional document type ID
+            properties: Optional document properties
+            
+        Returns:
+            Dictionary with upload result
+            
+        Raises:
+            UploadError: If upload fails
+        """
+        # Build API URL
+        # Format: {base_url}/{workspace}/api/document/{docId}
+        api_url = f"{self.config.api_url}/{self.config.api_workspace}/api/document/{doc_id}"
+        
+        # Prepare files for multipart upload
+        files = []
+        try:
+            for image_file in image_files:
+                if not os.path.exists(image_file):
+                    self.logger.warning(f"File not found, skipping: {image_file}")
+                    continue
+                
+                filename = os.path.basename(image_file)
+                files.append(('files', (filename, open(image_file, 'rb'), 'image/jpeg')))
+            
+            if not files:
+                raise UploadError("No valid files to upload")
+            
+            # Prepare form data
+            data = {}
+            if metadata:
+                data['meta'] = json.dumps(metadata)
+            if document_type:
+                data['documentType'] = document_type
+            if properties:
+                data['properties'] = json.dumps(properties)
+            
+            # Prepare headers
+            headers = {}
+            if self.config.api_token:
+                headers['Authorization'] = f'Bearer {self.config.api_token}'
+            
+            # Make request
+            response = requests.post(  # type: ignore
+                api_url,
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=self.config.api_timeout
+            )
+            
+            # Close file handles
+            for _, (_, file_obj, _) in files:
+                file_obj.close()
+            
+            # Handle response
+            if response.status_code in [200, 201]:
+                try:
+                    result = response.json()
+                    self.logger.info(f"Pages appended successfully: {result}")
+                    return {
+                        'success': True,
+                        'response': result,
+                        'doc_id': result.get('docId', doc_id),
+                        'pages_added': result.get('pagesAdded', len(image_files)),
+                        'total_pages': result.get('totalPages')
+                    }
+                except json.JSONDecodeError:
+                    self.logger.warning("Response was not valid JSON")
+                    return {
+                        'success': True,
+                        'response': response.text,
+                        'doc_id': doc_id,
+                        'pages_added': len(image_files),
+                        'total_pages': None
+                    }
+            else:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                self.logger.error(f"Page append failed: {error_msg}")
+                raise UploadError(error_msg)
+                
+        except Exception as e:
+            self.logger.error(f"Page append error: {e}")
+            raise UploadError(f"Page append error: {e}")
     
     def test_connection(self) -> Dict[str, Any]:
         """Test connection to API.

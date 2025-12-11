@@ -39,3 +39,10 @@ logging:
   file: "/var/log/piscan.log"  # Log file path
   max_size: 10485760  # Maximum log file size (10MB)
   backup_count: 5  # Number of log backups to keep
+
+# Sound notifications
+sound:
+  enabled: false  # Enable sound notifications
+  success_sound: "/usr/share/sounds/freedesktop/stereo/complete.oga"  # Sound file for successful upload
+  error_sound: "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"  # Sound file for errors
+  volume: 70  # Volume percentage (0-100)

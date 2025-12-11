@@ -42,6 +42,12 @@ class Config:
             "file": "/var/log/piscan.log",
             "max_size": 10485760,  # 10MB
             "backup_count": 5
+        },
+        "sound": {
+            "enabled": False,  # Enable sound notifications
+            "success_sound": "/usr/share/sounds/freedesktop/stereo/complete.oga",  # Sound file for successful upload
+            "error_sound": "/usr/share/sounds/freedesktop/stereo/dialog-error.oga",  # Sound file for errors
+            "volume": 70  # Volume percentage (0-100)
         }
     }
     
@@ -240,6 +246,26 @@ class Config:
     def log_max_size(self) -> int:
         """Get maximum log file size."""
         return self.get('logging.max_size')
+    
+    @property
+    def sound_enabled(self) -> bool:
+        """Whether sound notifications are enabled."""
+        return self.get('sound.enabled', False)
+    
+    @property
+    def success_sound(self) -> str:
+        """Get success sound file path."""
+        return self.get('sound.success_sound', '/usr/share/sounds/freedesktop/stereo/complete.oga')
+    
+    @property
+    def error_sound(self) -> str:
+        """Get error sound file path."""
+        return self.get('sound.error_sound', '/usr/share/sounds/freedesktop/stereo/dialog-error.oga')
+    
+    @property
+    def sound_volume(self) -> int:
+        """Get sound volume (0-100)."""
+        return self.get('sound.volume', 70)
     
     @property
     def log_backup_count(self) -> int:

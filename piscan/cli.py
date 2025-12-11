@@ -66,6 +66,11 @@ try:
 except ImportError:
     pass
 
+try:
+    from .sound_player import SoundPlayer
+except ImportError:
+    pass
+
 
 class ScanManager:
     """Main scan manager that coordinates all components."""
@@ -100,6 +105,7 @@ class ScanManager:
         self.blank_detector = BlankPageDetector(self.config)
         self.uploader = Uploader(self.config)
         self.server = ScanServer(self.config, self)
+        self.sound_player = SoundPlayer(self.config) if SoundPlayer else None
         
         # State
         self.scanning = False
@@ -181,6 +187,10 @@ class ScanManager:
                 upload_result = self.uploader.upload_document(
                     scanned_files, doc_id, metadata, document_type, properties
                 )
+                
+                # Play success sound after upload completes
+                if self.sound_player:
+                    self.sound_player.play_success()
             
             # Cleanup on success (unless keep_files is True)
             if not keep_files:
@@ -217,6 +227,10 @@ class ScanManager:
             
         except Exception as e:
             self.logger.error(f"Scan job failed: {e}")
+            
+            # Play error sound
+            if self.sound_player:
+                self.sound_player.play_error()
             
             # Move to failed directory
             scan_dir = locals().get('scan_dir')
