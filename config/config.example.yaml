@@ -1,0 +1,41 @@
+# Piscan Configuration Example
+
+# Scanner settings
+scanner:
+  device: ""  # Auto-detect if empty, or specify like "canon_dr:libusb:001:002"
+  resolution: 300  # DPI
+  mode: "Color"  # Color, Gray, Lineart
+  source: "Auto"  # Auto, ADF, Flatbed
+  format: "png"  # png, jpeg, tiff
+
+# API settings
+api:
+  workspace: "difo"  # Workspace for API endpoint (e.g., "difo")
+  url: "https://scan.haider.vc"  # Base API URL (without workspace path)
+  token: ""  # Bearer token for authentication (your API key here)
+  timeout: 60  # Request timeout in seconds
+
+# Storage settings
+storage:
+  temp_dir: "/tmp"  # Base directory for temporary scan files
+  failed_dir: "/tmp/failed"  # Directory for failed jobs
+  keep_failed: true  # Whether to keep failed scan jobs
+
+# Processing settings
+processing:
+  skip_blank: true  # Whether to skip blank pages
+  blank_threshold: 0.03  # Fraction of non-white pixels to consider page blank (3%)
+  white_threshold: 250  # Pixel brightness > 250 considered white
+
+# HTTP server settings
+server:
+  host: "0.0.0.0"  # Server bind address
+  port: 5000  # Server port
+  debug: false  # Debug mode
+
+# Logging settings
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "/var/log/piscan.log"  # Log file path
+  max_size: 10485760  # Maximum log file size (10MB)
+  backup_count: 5  # Number of log backups to keep
