@@ -75,12 +75,15 @@ class Scanner:
             self.logger.error(f"Scanner test error: {e}")
             return False
     
-    def scan_pages(self, output_dir: str, source: Optional[str] = None) -> List[str]:
+    def scan_pages(self, output_dir: str, source: Optional[str] = None, 
+                   page_callback=None) -> List[str]:
         """Scan pages to output directory.
         
         Args:
             output_dir: Directory to save scanned pages
-            output_dir: Source to scan from (ADF, Flatbed, or Auto)
+            source: Source to scan from (ADF, Flatbed, or Auto)
+            page_callback: Optional callback function called when each page is ready.
+                          Called with (page_number, file_path) as arguments.
             
         Returns:
             List of scanned file paths
@@ -111,13 +114,62 @@ class Scanner:
         self.logger.debug(f"Scan command: {' '.join(cmd)}")
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            # If callback provided, monitor for pages in real-time
+            if page_callback:
+                import threading
+                import time
+                
+                scan_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                scanned_files = []
+                seen_files = set()
+                
+                def monitor_pages():
+                    """Monitor directory for new page files."""
+                    page_num = 0
+                    while scan_process.poll() is None:
+                        time.sleep(0.3)  # Check every 300ms
+                        try:
+                            for filename in sorted(os.listdir(output_dir)):
+                                pattern = f"page_.*\\.{format_ext}$"
+                                if re.match(pattern, filename):
+                                    filepath = os.path.join(output_dir, filename)
+                                    if filepath not in seen_files:
+                                        # Wait briefly to ensure file is fully written
+                                        time.sleep(0.2)
+                                        seen_files.add(filepath)
+                                        scanned_files.append(filepath)
+                                        page_num += 1
+                                        self.logger.debug(f"Page {page_num} ready: {filepath}")
+                                        try:
+                                            page_callback(page_num, filepath)
+                                        except Exception as e:
+                                            self.logger.error(f"Callback error: {e}")
+                        except Exception as e:
+                            self.logger.warning(f"Error monitoring pages: {e}")
+                
+                monitor_thread = threading.Thread(target=monitor_pages, daemon=True)
+                monitor_thread.start()
+                
+                # Wait for scan to complete
+                stdout, stderr = scan_process.communicate(timeout=300)
+                monitor_thread.join(timeout=2)
+                
+                # Build result object
+                returncode = scan_process.returncode
+                output_text = (stdout + stderr).lower()
+            else:
+                # Original synchronous behavior
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                stdout = result.stdout
+                stderr = result.stderr
+                returncode = result.returncode
+                output_text = (stdout + stderr).lower()
+                scanned_files = []  # Will be populated below
             
             # Check for common error conditions in output
-            output_text = (result.stdout + result.stderr).lower()
             
-            if result.returncode != 0 or "document feeder out of documents" in output_text:
-                error_msg = result.stderr or result.stdout or "Unknown scan error"
+            if returncode != 0 or "document feeder out of documents" in output_text:
+                error_msg = stderr or stdout or "Unknown scan error"
                 
                 # Provide helpful error messages
                 if "document feeder out of documents" in output_text or "feeder out" in output_text:
@@ -131,16 +183,17 @@ class Scanner:
                 self.logger.error(f"Scan failed: {error_msg}")
                 raise ScannerError(f"Scan failed: {error_msg}")
             
-            # Find scanned files
-            # Note: scanimage uses 'jpg' extension for jpeg format
-            format_ext = 'jpg' if self.config.scanner_format == 'jpeg' else self.config.scanner_format
-            scanned_files = []
-            pattern = f"page_.*\\.{format_ext}$"
-            for filename in os.listdir(output_dir):
-                if re.match(pattern, filename):
-                    scanned_files.append(os.path.join(output_dir, filename))
+            # Find scanned files (only needed if no callback was used)
+            if not page_callback:
+                # Note: scanimage uses 'jpg' extension for jpeg format
+                format_ext = 'jpg' if self.config.scanner_format == 'jpeg' else self.config.scanner_format
+                pattern = f"page_.*\\.{format_ext}$"
+                for filename in os.listdir(output_dir):
+                    if re.match(pattern, filename):
+                        scanned_files.append(os.path.join(output_dir, filename))
+                
+                scanned_files.sort()  # Ensure proper order
             
-            scanned_files.sort()  # Ensure proper order
             self.logger.info(f"Scanned {len(scanned_files)} pages")
             
             # Better error message if no pages found

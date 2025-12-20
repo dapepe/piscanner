@@ -169,24 +169,65 @@ class ScanManager:
             # Create scan directory
             scan_dir = self.file_manager.create_scan_directory()
             
-            # Scan pages
-            scanned_files = self.scanner.scan_pages(scan_dir, source)
+            # Set up concurrent upload if enabled
+            upload_result = {}
+            doc_id_result = None
+            page_count = [0]  # Use list to allow modification in callback
+            upload_errors = []
+            
+            def page_ready_callback(page_num, filepath):
+                """Called when each page is scanned - upload immediately."""
+                if not upload:
+                    return
+                
+                try:
+                    nonlocal doc_id_result
+                    
+                    # Skip blank pages if configured
+                    if self.config.skip_blank:
+                        is_blank = self.blank_detector.is_blank(filepath)
+                        if is_blank:
+                            self.logger.info(f"Page {page_num} is blank, skipping upload")
+                            self.blank_detector.remove_blank_files([filepath])
+                            return
+                    
+                    if page_num == 1:
+                        # Create document with first page
+                        self.logger.info(f"Creating document with page {page_num}")
+                        result = self.uploader._create_document(
+                            [filepath], doc_id, metadata, document_type, properties
+                        )
+                        doc_id_result = result.get('doc_id')
+                        self.logger.info(f"Document created: {doc_id_result}")
+                        page_count[0] = 1
+                    else:
+                        # Append subsequent pages
+                        if doc_id_result:
+                            self.logger.info(f"Appending page {page_num}")
+                            self.uploader._append_pages(doc_id_result, [filepath])
+                            page_count[0] += 1
+                except Exception as e:
+                    self.logger.error(f"Upload error for page {page_num}: {e}")
+                    upload_errors.append(str(e))
+            
+            # Scan pages with callback for concurrent upload
+            callback = page_ready_callback if upload else None
+            scanned_files = self.scanner.scan_pages(scan_dir, source, page_callback=callback)
             
             if not scanned_files:
                 raise Exception("No pages were scanned")
             
-            # Filter blank pages
-            if self.config.skip_blank:
-                non_blank_files, blank_files = self.blank_detector.filter_blank_pages(scanned_files)
-                self.blank_detector.remove_blank_files(blank_files)
-                scanned_files = non_blank_files
+            # Check for upload errors
+            if upload_errors:
+                raise Exception(f"Upload failed: {upload_errors[0]}")
             
-            # Upload to API (if enabled)
-            upload_result = {}
-            if upload:
-                upload_result = self.uploader.upload_document(
-                    scanned_files, doc_id, metadata, document_type, properties
-                )
+            # Build upload result
+            if upload and doc_id_result:
+                upload_result = {
+                    'doc_id': doc_id_result,
+                    'pages_added': page_count[0],
+                    'total_pages': page_count[0]
+                }
                 
                 # Play success sound after upload completes
                 if self.sound_player:

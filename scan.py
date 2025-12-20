@@ -57,75 +57,163 @@ def scan_document(config, source=None, format_type=None, debug=False):
     if debug:
         print(f"Command: {' '.join(cmd)}")
     
-    print("Scanning...")
+    print("Scanning and uploading pages as they complete...")
     
-    # Run scan
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    # Run scan in background and monitor for new files
+    import threading
+    import queue
+    
+    scan_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    
+    # Queue to communicate between scanning monitor and uploader
+    upload_queue = queue.Queue()
+    scan_complete = threading.Event()
+    upload_error = []
+    scanned_files = []
+    
+    def monitor_scan_output():
+        """Monitor scan directory for new files."""
+        seen_files = set()
+        scan_failed = False
+        
+        while not scan_complete.is_set() or scan_process.poll() is None:
+            time.sleep(0.5)  # Check every 500ms
+            
+            # Look for new page files
+            try:
+                current_files = set()
+                for filename in os.listdir(scan_dir):
+                    if filename.startswith('page_') and filename.endswith(f'.{format_ext}'):
+                        filepath = os.path.join(scan_dir, filename)
+                        current_files.add(filepath)
+                        
+                        # New file detected
+                        if filepath not in seen_files:
+                            # Wait a bit to ensure file is fully written
+                            time.sleep(0.2)
+                            seen_files.add(filepath)
+                            scanned_files.append(filepath)
+                            upload_queue.put(filepath)
+                            if debug:
+                                print(f"[Scan] Page {len(scanned_files)} ready")
+            except Exception as e:
+                if debug:
+                    print(f"[Scan] Error monitoring: {e}")
+        
+        # Signal that scanning is done
+        upload_queue.put(None)
+    
+    def upload_pages():
+        """Upload pages as they become available."""
+        import requests
+        headers = {'Authorization': f'Bearer {api_token}'}
+        doc_id = None
+        page_num = 0
+        
+        while True:
+            filepath = upload_queue.get()
+            
+            if filepath is None:  # Scanning complete
+                break
+            
+            page_num += 1
+            
+            try:
+                if page_num == 1:
+                    # Create document with first page
+                    create_endpoint = f"{api_url}/{api_workspace}/api/document/"
+                    if debug:
+                        print(f"[Upload] Creating document with page 1")
+                    
+                    with open(filepath, 'rb') as f:
+                        files = [('files', (os.path.basename(filepath), f, 'image/jpeg'))]
+                        response = requests.post(create_endpoint, files=files, headers=headers, timeout=60)
+                    
+                    if response.status_code not in [200, 201]:
+                        upload_error.append(f"Failed to create document - HTTP {response.status_code}: {response.text}")
+                        scan_complete.set()
+                        break
+                    
+                    result = response.json()
+                    doc_id = result.get('docId')
+                    if not doc_id:
+                        upload_error.append("No document ID returned from server")
+                        scan_complete.set()
+                        break
+                    
+                    print(f"✓ Page 1 uploaded (Document ID: {doc_id})")
+                else:
+                    # Append subsequent pages
+                    append_endpoint = f"{api_url}/{api_workspace}/api/document/{doc_id}"
+                    if debug:
+                        print(f"[Upload] Appending page {page_num}")
+                    
+                    with open(filepath, 'rb') as f:
+                        files = [('files', (os.path.basename(filepath), f, 'image/jpeg'))]
+                        response = requests.post(append_endpoint, files=files, headers=headers, timeout=60)
+                    
+                    if response.status_code not in [200, 201]:
+                        upload_error.append(f"Failed to append page {page_num} - HTTP {response.status_code}: {response.text}")
+                        scan_complete.set()
+                        break
+                    
+                    print(f"✓ Page {page_num} uploaded")
+                
+            except Exception as e:
+                upload_error.append(f"Upload error on page {page_num}: {e}")
+                scan_complete.set()
+                break
+    
+    # Start threads
+    scan_thread = threading.Thread(target=monitor_scan_output, daemon=True)
+    upload_thread = threading.Thread(target=upload_pages, daemon=True)
+    
+    scan_thread.start()
+    upload_thread.start()
+    
+    # Wait for scan process to complete
+    stdout, stderr = scan_process.communicate(timeout=300)
     
     if debug:
-        print(f"Scan output: {result.stdout}")
-        print(f"Scan errors: {result.stderr}")
+        print(f"\n[Scan] Output: {stdout}")
+        print(f"[Scan] Errors: {stderr}")
     
-    # Find scanned files first - if we have files, the scan worked
-    scanned_files = []
-    for filename in sorted(os.listdir(scan_dir)):
-        if filename.startswith('page_') and filename.endswith(f'.{format_ext}'):
-            scanned_files.append(os.path.join(scan_dir, filename))
+    scan_complete.set()
     
-    # Check for actual errors - only fail if no files were created AND there was an error
+    # Wait for upload thread to finish
+    upload_thread.join(timeout=120)
+    
+    # Check for errors
+    if upload_error:
+        print(f"\nError: {upload_error[0]}")
+        # Clean up
+        for filepath in scanned_files:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        if os.path.exists(scan_dir):
+            os.rmdir(scan_dir)
+        sys.exit(1)
+    
     if not scanned_files:
-        output = (result.stdout + result.stderr).lower()
-        if result.returncode != 0:
-            print(f"Error: Scan failed - {result.stderr}")
+        output = (stdout + stderr).lower()
+        if scan_process.returncode != 0:
+            print(f"Error: Scan failed - {stderr}")
             sys.exit(1)
         elif 'invalid argument' in output:
-            print(f"Error: Scanner configuration error - {result.stderr}")
+            print(f"Error: Scanner configuration error - {stderr}")
             sys.exit(1)
         else:
             print("Error: No pages were scanned. Please load paper in the document feeder.")
             sys.exit(1)
     
-    print(f"Scanned {len(scanned_files)} pages")
-    
-    # Upload to API
-    import requests
-    
-    endpoint = f"{api_url}/{api_workspace}/api/document/"
-    
-    if debug:
-        print(f"Uploading to: {endpoint}")
-    
-    files = []
-    for filepath in scanned_files:
-        filename = os.path.basename(filepath)
-        files.append(('files', (filename, open(filepath, 'rb'), 'image/jpeg')))
-    
-    headers = {'Authorization': f'Bearer {api_token}'}
-    
-    print("Uploading...")
-    response = requests.post(endpoint, files=files, headers=headers, timeout=60)
-    
-    # Close file handles
-    for _, (_, f, _) in files:
-        f.close()
+    print(f"\n✓ Scan and upload complete - {len(scanned_files)} pages processed")
     
     # Clean up
     for filepath in scanned_files:
-        os.remove(filepath)
-    os.rmdir(scan_dir)
-    
-    if response.status_code in [200, 201]:
-        print("✓ Upload successful")
-        try:
-            result = response.json()
-            if 'docId' in result:
-                print(f"Document ID: {result['docId']}")
-        except:
-            pass
-    else:
-        print(f"Error: Upload failed - HTTP {response.status_code}")
-        print(response.text)
-        sys.exit(1)
+        if os.path.exists(filepath):
+            os.remove(filepath)
+    if os.path.exists(scan_dir):
+        os.rmdir(scan_dir)
 
 def main():
     parser = argparse.ArgumentParser(description='Scan documents and upload to API')
