@@ -3,7 +3,7 @@
 import os
 import shutil
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 # Simple logger fallback - silent unless debug enabled
 _debug_enabled = os.environ.get('PISCAN_DEBUG', '').lower() in ('1', 'true', 'yes')
@@ -42,15 +42,63 @@ class FileManager:
     def create_scan_directory(self) -> str:
         """Create a timestamped directory for a new scan job.
         
+        Runs retention cleanup as a lightweight "periodic" task.
+        
         Returns:
             Path to the created directory
         """
+        try:
+            self.cleanup_old_temp_jobs(self.config.temp_retention_hours)
+            self.cleanup_old_failed_jobs(self.config.failed_retention_days)
+        except Exception as e:
+            self.logger.warning(f"Retention cleanup skipped: {e}")
+
         timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         scan_dir = os.path.join(self.config.temp_dir, timestamp)
         os.makedirs(scan_dir, exist_ok=True)
         
         self.logger.info(f"Created scan directory: {scan_dir}")
         return scan_dir
+
+    def cleanup_old_temp_jobs(self, max_age_hours: int = 168) -> None:
+        """Clean up old temp scan directories.
+
+        This removes scan directories under `storage.temp_dir` that match our
+        naming patterns and are older than `max_age_hours`.
+
+        Args:
+            max_age_hours: Maximum age in hours to keep temp scan jobs
+        """
+        if not os.path.exists(self.config.temp_dir):
+            return
+
+        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+
+        for item in os.listdir(self.config.temp_dir):
+            item_path = os.path.join(self.config.temp_dir, item)
+
+            if not os.path.isdir(item_path):
+                continue
+
+            # Only touch directories that look like our scan jobs
+            # - FileManager style: YYYY-MM-DD-HHMMSS
+            # - scanbd style: scan-YYYY-MM-DD-HHMMSS
+            is_job_dir = (
+                len(item) == 15 and item[4] == '-' and item[7] == '-' and item[10] == '-'
+            ) or (
+                item.startswith('scan-') and len(item) == 20 and item[9] == '-' and item[12] == '-' and item[15] == '-'
+            )
+
+            if not is_job_dir:
+                continue
+
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(item_path))
+                if mtime < cutoff:
+                    shutil.rmtree(item_path, ignore_errors=True)
+                    self.logger.info(f"Cleaned up old temp job: {item}")
+            except Exception as e:
+                self.logger.warning(f"Failed to cleanup temp job {item}: {e}")
     
     def generate_doc_id(self, timestamp: Optional[str] = None) -> str:
         """Generate a document ID with timestamp and hash.

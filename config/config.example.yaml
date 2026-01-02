@@ -21,6 +21,8 @@ storage:
   temp_dir: "/tmp"  # Base directory for temporary scan files
   failed_dir: "/tmp/failed"  # Directory for failed jobs
   keep_failed: true  # Whether to keep failed scan jobs
+  temp_retention_hours: 168  # Delete temp scan dirs older than this (hours)
+  failed_retention_days: 30  # Delete failed jobs older than this (days)
 
 # Upload settings
 upload:

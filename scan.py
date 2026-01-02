@@ -25,10 +25,9 @@ def scan_document(config, source=None, format_type=None, debug=False):
     if format_type:
         config.set('scanner.format', format_type)
     
-    # Create temp directory
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    scan_dir = f"/tmp/{timestamp}"
-    os.makedirs(scan_dir, exist_ok=True)
+    # Create temp directory via FileManager (also runs retention cleanup)
+    file_manager = FileManager(config)
+    scan_dir = file_manager.create_scan_directory()
     
     if debug:
         print(f"Scan directory: {scan_dir}")
@@ -39,7 +38,7 @@ def scan_document(config, source=None, format_type=None, debug=False):
         # Initialize components
         uploader = Uploader(config)
         scanner = Scanner(config, uploader=uploader)
-        file_manager = FileManager(config)
+        # file_manager already created above to make scan_dir
         
         if debug:
             print(f"Scanner device: {scanner.device}")
