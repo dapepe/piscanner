@@ -15,7 +15,7 @@ class Config:
             "mode": "Color",
             "source": "Auto",  # Auto, ADF, Flatbed
             "format": "png",
-            "color_correction": "none"  # none, swap_rb, swap_rg, bgr_to_rgb
+            "color_correction": "none"  # none, swap_rb, swap_rg, swap_gb, rotate_left, rotate_right, bgr_to_rgb
         },
         "api": {
             "workspace": "default",
@@ -26,7 +26,9 @@ class Config:
         "storage": {
             "temp_dir": "/tmp",
             "failed_dir": "/tmp/failed",
-            "keep_failed": True
+            "keep_failed": True,
+            "temp_retention_hours": 168,  # Delete temp scan dirs older than this (7 days)
+            "failed_retention_days": 30  # Delete failed jobs older than this
         },
         "processing": {
             "skip_blank": True,
@@ -48,7 +50,13 @@ class Config:
             "enabled": False,  # Enable sound notifications
             "success_sound": "/usr/share/sounds/freedesktop/stereo/complete.oga",  # Sound file for successful upload
             "error_sound": "/usr/share/sounds/freedesktop/stereo/dialog-error.oga",  # Sound file for errors
-            "volume": 70  # Volume percentage (0-100)
+            "volume": 70,  # Volume percentage (0-100)
+            "device": ""  # Optional ALSA/Pulse output device (e.g. "plughw:1,0" for USB)
+        },
+        "upload": {
+            "compression": "individual",  # individual, zip
+            "image_quality": 90,  # JPEG quality (1-100)
+            "optimize_png": True  # Optimize PNG files
         }
     }
     
@@ -64,8 +72,16 @@ class Config:
     
     def _get_default_config_path(self) -> str:
         """Get default configuration file path."""
-        # Check common locations (prioritize local config directory)
+        # Allow explicit override (useful for systemd/scanbd environments)
+        env_path = os.environ.get("PISCAN_CONFIG")
+        if env_path and os.path.exists(env_path):
+            return env_path
+
+        # Check common locations.
+        # NOTE: system services often run with CWD=/, so include the canonical
+        # /opt/piscan path to ensure the same config is used everywhere.
         paths = [
+            "/opt/piscan/config/config.yaml",  # Canonical install location
             "./config/config.yaml",  # Local config directory (recommended)
             os.path.expanduser("~/.piscan/config.yaml"),  # User home directory
             "/etc/piscan/config.yaml",  # System-wide
@@ -272,8 +288,38 @@ class Config:
     def sound_volume(self) -> int:
         """Get sound volume (0-100)."""
         return self.get('sound.volume', 70)
+
+    @property
+    def sound_device(self) -> str:
+        """Optional audio output device string."""
+        return self.get('sound.device', '')
     
     @property
     def log_backup_count(self) -> int:
         """Get log backup count."""
         return self.get('logging.backup_count')
+
+    @property
+    def temp_retention_hours(self) -> int:
+        """Max age (hours) to keep temp scan dirs."""
+        return int(self.get('storage.temp_retention_hours', 168))
+
+    @property
+    def failed_retention_days(self) -> int:
+        """Max age (days) to keep failed scan dirs."""
+        return int(self.get('storage.failed_retention_days', 30))
+    
+    @property
+    def upload_compression(self) -> str:
+        """Get upload compression mode."""
+        return self.get('upload.compression', 'individual')
+    
+    @property
+    def upload_image_quality(self) -> int:
+        """Get upload image quality."""
+        return self.get('upload.image_quality', 90)
+    
+    @property
+    def upload_optimize_png(self) -> bool:
+        """Whether to optimize PNG files."""
+        return self.get('upload.optimize_png', True)

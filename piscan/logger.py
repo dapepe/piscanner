@@ -64,14 +64,21 @@ class Logger:
         # File handler with rotation
         log_file = getattr(config, 'log_file', None)
         if log_file:
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
-            file_handler = logging.handlers.RotatingFileHandler(
-                log_file,
-                maxBytes=getattr(config, 'log_max_size', 10485760),
-                backupCount=getattr(config, 'log_backup_count', 5)
-            )
-            file_handler.setFormatter(formatter)
-            self._logger.addHandler(file_handler)
+            try:
+                log_dir = os.path.dirname(log_file) or '.'
+                os.makedirs(log_dir, exist_ok=True)
+
+                file_handler = logging.handlers.RotatingFileHandler(
+                    log_file,
+                    maxBytes=getattr(config, 'log_max_size', 10485760),
+                    backupCount=getattr(config, 'log_backup_count', 5)
+                )
+                file_handler.setFormatter(formatter)
+                self._logger.addHandler(file_handler)
+            except (OSError, PermissionError) as e:
+                # Common when running under restricted users (e.g. scanbd/saned)
+                # and the log file is under /var/log.
+                self._logger.warning(f"Failed to open log file {log_file}: {e}")
     
     def get_logger(self) -> logging.Logger:
         """Get the configured logger.

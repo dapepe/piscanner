@@ -7,7 +7,7 @@ scanner:
   mode: "Color"  # Color, Gray, Lineart
   source: "Auto"  # Auto, ADF, Flatbed
   format: "png"  # png, jpeg, tiff
-  color_correction: "swap_rb"  # Color channel correction: "none", "swap_rb" (swap red/blue), "swap_rg" (swap red/green), "bgr_to_rgb"
+  color_correction: "swap_rb"  # Color channel correction: "none", "swap_rb" (swap red/blue), "swap_rg" (swap red/green), "swap_gb" (swap green/blue), "rotate_left" (RGB->GBR), "rotate_right" (RGB->BRG), "bgr_to_rgb"
 
 # API settings
 api:
@@ -21,6 +21,12 @@ storage:
   temp_dir: "/tmp"  # Base directory for temporary scan files
   failed_dir: "/tmp/failed"  # Directory for failed jobs
   keep_failed: true  # Whether to keep failed scan jobs
+
+# Upload settings
+upload:
+  compression: "individual"  # Compression mode: "individual" (upload as separate files), "zip" (compress to ZIP before upload)
+  image_quality: 90  # JPEG quality for compression (1-100, higher = better quality but larger file)
+  optimize_png: true  # Optimize PNG files to reduce size
 
 # Processing settings
 processing:
@@ -47,3 +53,4 @@ sound:
   success_sound: "/usr/share/sounds/freedesktop/stereo/complete.oga"  # Sound file for successful upload
   error_sound: "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"  # Sound file for errors
   volume: 70  # Volume percentage (0-100)
+  device: ""  # Optional ALSA device for aplay (e.g. "plughw:1,0" for USB soundbar)

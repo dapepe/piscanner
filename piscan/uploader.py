@@ -2,6 +2,9 @@
 
 import json
 import os
+import zipfile
+import tempfile
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 try:
@@ -47,6 +50,98 @@ class Uploader:
         
         if not self.enabled:
             self.logger.warning("requests library not available - HTTP upload disabled")
+
+    def _guess_mime_type(self, file_path: str) -> str:
+        """Best-effort MIME type based on extension."""
+        ext = os.path.splitext(file_path.lower())[1]
+        if ext in ('.jpg', '.jpeg'):
+            return 'image/jpeg'
+        if ext == '.png':
+            return 'image/png'
+        if ext in ('.tif', '.tiff'):
+            return 'image/tiff'
+        if ext == '.pdf':
+            return 'application/pdf'
+        if ext == '.zip':
+            return 'application/zip'
+        return 'application/octet-stream'
+    
+    def log_error(self, message: str, level: str = "error", details: Optional[Dict[str, Any]] = None) -> None:
+        """Log error to API endpoint.
+        
+        Args:
+            message: Error message
+            level: Log level (info, warn, error)
+            details: Optional additional details
+        """
+        if not self.enabled:
+            self.logger.warning("Cannot log to API - requests library missing")
+            return
+        
+        try:
+            log_url = f"{self.config.api_url}/{self.config.api_workspace}/api/log"
+            
+            payload: Dict[str, Any] = {
+                "level": level,
+                "message": message,
+                "source": "scanner",
+                "clientTimestamp": datetime.utcnow().isoformat() + "Z"
+            }
+            
+            if details:
+                payload["details"] = details
+            
+            headers = {
+                "Content-Type": "application/json"
+            }
+            if self.config.api_token:
+                headers["Authorization"] = f"Bearer {self.config.api_token}"
+            
+            response = requests.post(  # type: ignore
+                log_url,
+                json=payload,
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code in [200, 201]:
+                self.logger.debug(f"Error logged to API: {message}")
+            else:
+                self.logger.warning(f"Failed to log error to API: HTTP {response.status_code}")
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to log error to API: {e}")
+    
+    def _compress_to_zip(self, image_files: List[str]) -> str:
+        """Compress image files to a ZIP archive.
+        
+        Args:
+            image_files: List of image file paths
+            
+        Returns:
+            Path to created ZIP file
+        """
+        # Create temporary ZIP file
+        temp_zip = tempfile.NamedTemporaryFile(mode='w+b', suffix='.zip', delete=False)
+        zip_path = temp_zip.name
+        temp_zip.close()
+        
+        try:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for image_file in image_files:
+                    if os.path.exists(image_file):
+                        arcname = os.path.basename(image_file)
+                        zipf.write(image_file, arcname=arcname)
+                        self.logger.debug(f"Added {arcname} to ZIP")
+            
+            self.logger.info(f"Created ZIP archive: {zip_path} ({len(image_files)} files)")
+            return zip_path
+            
+        except Exception as e:
+            # Clean up on error
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            raise UploadError(f"Failed to create ZIP archive: {e}")
     
     def upload_document(self, image_files: List[str], doc_id: Optional[str] = None,
                        metadata: Optional[Dict[str, Any]] = None,
@@ -74,6 +169,33 @@ class Uploader:
         
         if not image_files:
             raise UploadError("No files to upload")
+        
+        # Check if ZIP compression is enabled
+        compression_mode = self.config.upload_compression
+        
+        if compression_mode == "zip":
+            # Always ZIP when enabled (even for single-page scans)
+            
+            self.logger.info(f"Creating ZIP archive for {len(image_files)} pages")
+            try:
+                zip_path = self._compress_to_zip(image_files)
+                # Upload ZIP as single file
+                result = self._create_document(
+                    [zip_path],
+                    doc_id=doc_id,
+                    metadata=metadata,
+                    document_type=document_type,
+                    properties=properties
+                )
+                # Clean up ZIP file
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+                return result
+            except Exception as e:
+                error_msg = f"Failed to upload ZIP: {e}"
+                self.logger.error(error_msg)
+                self.log_error(error_msg, level="error", details={"file_count": len(image_files)})
+                raise UploadError(error_msg)
         
         self.logger.info(f"Uploading {len(image_files)} pages incrementally")
         
@@ -149,7 +271,8 @@ class Uploader:
                     continue
                 
                 filename = os.path.basename(image_file)
-                files.append(('files', (filename, open(image_file, 'rb'), 'image/jpeg')))
+                content_type = self._guess_mime_type(image_file)
+                files.append(('files', (filename, open(image_file, 'rb'), content_type)))
             
             if not files:
                 raise UploadError("No valid files to upload")
@@ -243,7 +366,8 @@ class Uploader:
                     continue
                 
                 filename = os.path.basename(image_file)
-                files.append(('files', (filename, open(image_file, 'rb'), 'image/jpeg')))
+                content_type = self._guess_mime_type(image_file)
+                files.append(('files', (filename, open(image_file, 'rb'), content_type)))
             
             if not files:
                 raise UploadError("No valid files to upload")

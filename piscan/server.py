@@ -162,11 +162,13 @@ class ScanServer:
             """Get current configuration (safe values only)."""
             try:
                 safe_config = {
+                    'config_path': getattr(self.config, 'config_path', None),
                     'scanner': {
                         'resolution': self.config.scanner_resolution,
                         'mode': self.config.scanner_mode,
                         'source': self.config.scanner_source,
-                        'format': self.config.scanner_format
+                        'format': self.config.scanner_format,
+                        'color_correction': self.config.scanner_color_correction
                     },
                     'api': {
                         'workspace': self.config.api_workspace,

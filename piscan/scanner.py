@@ -31,69 +31,100 @@ except ImportError:
 class Scanner:
     """Scanner interface using SANE scanimage utility."""
     
-    def __init__(self, config):
+    def __init__(self, config, uploader=None):
         """Initialize scanner interface.
         
         Args:
             config: Configuration object
+            uploader: Optional uploader instance for error logging
         """
         self.config = config
         self.logger = Logger()
         self.device = self._get_device()
+        self.uploader = uploader
     
     def _apply_color_correction(self, file_path: str) -> None:
-        """Apply color correction to scanned image.
+        """Apply color correction and optimization to scanned image.
         
         Args:
             file_path: Path to image file to correct
         """
         correction_mode = self.config.scanner_color_correction
+        optimize_png = self.config.upload_optimize_png
+        image_quality = self.config.upload_image_quality
         
-        if correction_mode == "none" or not correction_mode:
+        # Skip if no correction needed and no optimization
+        if (correction_mode == "none" or not correction_mode) and not optimize_png:
             return
         
         try:
             # Open image
             img = Image.open(file_path)
+            needs_save = False
             
-            # Only apply correction to color images
-            if img.mode not in ('RGB', 'RGBA'):
-                self.logger.debug(f"Skipping color correction for non-RGB image: {img.mode}")
-                return
+            # Apply color correction to color images
+            if correction_mode and correction_mode != "none" and img.mode in ('RGB', 'RGBA'):
+                # Split channels
+                has_alpha = img.mode == 'RGBA'
+                if has_alpha:
+                    r, g, b, a = img.split()
+                else:
+                    r, g, b = img.split()
+                    a = None
+                
+                # Apply correction based on mode
+                if correction_mode == "swap_rb" or correction_mode == "bgr_to_rgb":
+                    # Swap red and blue channels (BGR -> RGB or RGB -> BGR)
+                    corrected_channels = (b, g, r)
+                    self.logger.debug(f"Applied swap_rb correction to {file_path}")
+                    needs_save = True
+                elif correction_mode == "swap_rg":
+                    # Swap red and green channels
+                    corrected_channels = (g, r, b)
+                    self.logger.debug(f"Applied swap_rg correction to {file_path}")
+                    needs_save = True
+                elif correction_mode == "swap_gb":
+                    # Swap green and blue channels
+                    corrected_channels = (r, b, g)
+                    self.logger.debug(f"Applied swap_gb correction to {file_path}")
+                    needs_save = True
+                elif correction_mode == "rotate_left":
+                    # Rotate channels left: RGB -> GBR
+                    corrected_channels = (g, b, r)
+                    self.logger.debug(f"Applied rotate_left correction to {file_path}")
+                    needs_save = True
+                elif correction_mode == "rotate_right":
+                    # Rotate channels right: RGB -> BRG
+                    corrected_channels = (b, r, g)
+                    self.logger.debug(f"Applied rotate_right correction to {file_path}")
+                    needs_save = True
+                else:
+                    self.logger.warning(f"Unknown color correction mode: {correction_mode}")
+                    corrected_channels = None
+                
+                # Merge channels back
+                if corrected_channels:
+                    if has_alpha and a is not None:
+                        img = Image.merge('RGBA', corrected_channels + (a,))
+                    else:
+                        img = Image.merge('RGB', corrected_channels)
             
-            # Split channels
-            has_alpha = img.mode == 'RGBA'
-            if has_alpha:
-                r, g, b, a = img.split()
-            else:
-                r, g, b = img.split()
-                a = None
-            
-            # Apply correction based on mode
-            if correction_mode == "swap_rb" or correction_mode == "bgr_to_rgb":
-                # Swap red and blue channels (BGR -> RGB or RGB -> BGR)
-                corrected_channels = (b, g, r)
-                self.logger.debug(f"Applied swap_rb correction to {file_path}")
-            elif correction_mode == "swap_rg":
-                # Swap red and green channels
-                corrected_channels = (g, r, b)
-                self.logger.debug(f"Applied swap_rg correction to {file_path}")
-            else:
-                self.logger.warning(f"Unknown color correction mode: {correction_mode}")
-                return
-            
-            # Merge channels back
-            if has_alpha and a is not None:
-                corrected_img = Image.merge('RGBA', corrected_channels + (a,))
-            else:
-                corrected_img = Image.merge('RGB', corrected_channels)
-            
-            # Save corrected image (overwrite original)
-            corrected_img.save(file_path)
-            self.logger.debug(f"Color correction saved to {file_path}")
+            # Save with optimization if needed
+            if needs_save or optimize_png:
+                file_ext = file_path.lower().split('.')[-1]
+                save_kwargs = {}
+                
+                if file_ext in ['jpg', 'jpeg']:
+                    save_kwargs['quality'] = image_quality
+                    save_kwargs['optimize'] = True
+                elif file_ext == 'png' and optimize_png:
+                    save_kwargs['optimize'] = True
+                
+                img.save(file_path, **save_kwargs)
+                self.logger.debug(f"Image post-processing saved to {file_path}")
             
         except Exception as e:
-            self.logger.error(f"Failed to apply color correction to {file_path}: {e}")
+            self.logger.error(f"Failed to apply post-processing to {file_path}: {e}")
     
     def _get_device(self) -> str:
         """Get scanner device string.
@@ -212,6 +243,27 @@ class Scanner:
                 # Wait for scan to complete
                 stdout, stderr = scan_process.communicate(timeout=300)
                 monitor_thread.join(timeout=2)
+
+                # Final sweep: scanimage can exit quickly and still leave page files.
+                # Make sure we don't miss the last page(s) before evaluating errors.
+                try:
+                    pattern = f"page_.*\\.{format_ext}$"
+                    for filename in sorted(os.listdir(output_dir)):
+                        if re.match(pattern, filename):
+                            filepath = os.path.join(output_dir, filename)
+                            if filepath not in seen_files:
+                                seen_files.add(filepath)
+                                self._apply_color_correction(filepath)
+                                scanned_files.append(filepath)
+                                page_num = len(scanned_files)
+                                self.logger.debug(f"Page {page_num} ready (final sweep): {filepath}")
+                                if page_callback:
+                                    try:
+                                        page_callback(page_num, filepath)
+                                    except Exception as e:
+                                        self.logger.error(f"Callback error (final sweep): {e}")
+                except Exception as e:
+                    self.logger.warning(f"Error during final page sweep: {e}")
                 
                 # Build result object
                 returncode = scan_process.returncode
@@ -224,23 +276,6 @@ class Scanner:
                 returncode = result.returncode
                 output_text = (stdout + stderr).lower()
                 scanned_files = []  # Will be populated below
-            
-            # Check for common error conditions in output
-            
-            if returncode != 0 or "document feeder out of documents" in output_text:
-                error_msg = stderr or stdout or "Unknown scan error"
-                
-                # Provide helpful error messages
-                if "document feeder out of documents" in output_text or "feeder out" in output_text:
-                    if "flatbed" in actual_source.lower():
-                        error_msg = f"Flatbed scan failed. Note: The Canon DR-F120 has limited Flatbed support. Try using ADF source instead."
-                    else:
-                        error_msg = f"No paper in document feeder (source: {actual_source}). Please load paper into the ADF and try again."
-                elif "invalid argument" in output_text:
-                    error_msg = f"Scanner configuration error (source: {actual_source}): {error_msg}"
-                
-                self.logger.error(f"Scan failed: {error_msg}")
-                raise ScannerError(f"Scan failed: {error_msg}")
             
             # Find scanned files (only needed if no callback was used)
             if not page_callback:
@@ -256,22 +291,107 @@ class Scanner:
                 # Apply color correction to all scanned files
                 for filepath in scanned_files:
                     self._apply_color_correction(filepath)
-            
+
+            feeder_out = (
+                "document feeder out of documents" in output_text
+                or "feeder out" in output_text
+            )
+
+            # scanimage commonly exits non-zero when ADF is empty at the end.
+            # Treat this as success *if* we already scanned at least one page.
+            if returncode != 0:
+                raw_error = (stderr or stdout or "").strip() or "Unknown scan error"
+
+                if feeder_out and scanned_files:
+                    self.logger.info(
+                        f"Scan finished: ADF out of documents after {len(scanned_files)} page(s)"
+                    )
+                else:
+                    error_msg = raw_error
+
+                    # Provide helpful error messages
+                    if feeder_out:
+                        if "flatbed" in actual_source.lower():
+                            error_msg = (
+                                "Flatbed scan failed. Note: The Canon DR-F120 has limited Flatbed support. "
+                                "Try using ADF source instead."
+                            )
+                        else:
+                            error_msg = (
+                                f"No paper in document feeder (source: {actual_source}). "
+                                "Please load paper into the ADF and try again."
+                            )
+                    elif "invalid argument" in output_text:
+                        error_msg = f"Scanner configuration error (source: {actual_source}): {raw_error}"
+
+                    self.logger.error(f"Scan failed: {error_msg}")
+                    # Log to API if uploader is available
+                    if self.uploader:
+                        try:
+                            self.uploader.log_error(
+                                f"Scan failed: {error_msg}",
+                                level="error",
+                                details={
+                                    "source": actual_source,
+                                    "device": self.device,
+                                    "returncode": returncode,
+                                    "raw": raw_error,
+                                },
+                            )
+                        except Exception as log_err:
+                            self.logger.warning(f"Failed to log error to API: {log_err}")
+                    raise ScannerError(f"Scan failed: {error_msg}")
+
             self.logger.info(f"Scanned {len(scanned_files)} pages")
             
             # Better error message if no pages found
             if not scanned_files:
+                error_msg = "No pages were scanned. Please load paper into the document feeder and try again."
                 self.logger.error("No pages were scanned. Check if paper is loaded in the feeder.")
-                raise ScannerError("No pages were scanned. Please load paper into the document feeder and try again.")
+                # Log to API if uploader is available
+                if self.uploader:
+                    try:
+                        self.uploader.log_error(
+                            error_msg,
+                            level="error",
+                            details={"source": actual_source, "device": self.device}
+                        )
+                    except Exception as log_err:
+                        self.logger.warning(f"Failed to log error to API: {log_err}")
+                raise ScannerError(error_msg)
             
             return scanned_files
             
         except subprocess.TimeoutExpired:
-            self.logger.error("Scan timeout")
-            raise ScannerError("Scan timeout")
+            error_msg = "Scan timeout"
+            self.logger.error(error_msg)
+            # Log to API if uploader is available
+            if self.uploader:
+                try:
+                    self.uploader.log_error(
+                        error_msg,
+                        level="error",
+                        details={"source": actual_source, "device": self.device}
+                    )
+                except Exception as log_err:
+                    self.logger.warning(f"Failed to log error to API: {log_err}")
+            raise ScannerError(error_msg)
+        except ScannerError:
+            raise
         except Exception as e:
-            self.logger.error(f"Scan error: {e}")
-            raise ScannerError(f"Scan error: {e}")
+            error_msg = f"Scan error: {e}"
+            self.logger.error(error_msg)
+            # Log to API if uploader is available
+            if self.uploader:
+                try:
+                    self.uploader.log_error(
+                        error_msg,
+                        level="error",
+                        details={"source": actual_source, "device": self.device, "exception": str(e)}
+                    )
+                except Exception as log_err:
+                    self.logger.warning(f"Failed to log error to API: {log_err}")
+            raise ScannerError(error_msg)
     
     def _map_source_name(self, source: str) -> str:
         """Map generic source name to scanner-specific name.

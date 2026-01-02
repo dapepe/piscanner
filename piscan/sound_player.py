@@ -38,11 +38,21 @@ class SoundPlayer:
         self.config = config
         self.logger = Logger()
         self.enabled = config.sound_enabled
+        # Some service runners (e.g. scanbd) may kill child processes when the
+        # action script exits. Allow forcing blocking playback via env var.
+        self.blocking = os.environ.get('PISCAN_SOUND_BLOCKING', '').lower() in ('1', 'true', 'yes')
         self.player = self._detect_player()
         
         if self.enabled and not self.player:
             self.logger.warning("Sound notifications enabled but no audio player found")
             self.enabled = False
+
+    def _has_cmd(self, cmd: str) -> bool:
+        try:
+            result = subprocess.run(['which', cmd], capture_output=True, text=True, timeout=2)
+            return result.returncode == 0
+        except Exception:
+            return False
     
     def _detect_player(self) -> Optional[str]:
         """Detect available audio player.
@@ -104,10 +114,36 @@ class SoundPlayer:
             return
         
         try:
-            # Build command based on player
+            # Prefer correct pipeline for compressed audio (mp3/ogg/etc).
+            ext = os.path.splitext(sound_file.lower())[1]
+            device = getattr(self.config, 'sound_device', '')
+
+            # If we have a specific ALSA device configured, the most reliable way
+            # to play mp3 is: ffmpeg decode -> aplay -D <device>.
+            if ext in ('.mp3', '.ogg', '.oga', '.flac') and device and self._has_cmd('ffmpeg') and self._has_cmd('aplay'):
+                ffmpeg_cmd = ['ffmpeg', '-v', 'error', '-i', sound_file, '-f', 'wav', '-']
+                aplay_cmd = ['aplay', '-q', '-D', device]
+
+                if self.blocking:
+                    decoder = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    player = subprocess.run(aplay_cmd, stdin=decoder.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                    decoder.stdout.close() if decoder.stdout else None
+                    decoder.wait(timeout=10)
+                else:
+                    # Run in background: start a detached shell pipeline
+                    pipeline = f"ffmpeg -v error -i {sound_file!r} -f wav - | aplay -q -D {device!r}"
+                    subprocess.Popen(['bash', '-lc', pipeline], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+                self.logger.debug(f"Playing {sound_type} sound via ffmpeg->aplay (blocking={self.blocking})")
+                return
+
+            # Build command based on detected player
             if self.player == 'aplay':
-                # aplay is for WAV files, try to use it anyway
-                cmd = ['aplay', '-q', sound_file]
+                # aplay is for WAV files
+                if device:
+                    cmd = ['aplay', '-q', '-D', device, sound_file]
+                else:
+                    cmd = ['aplay', '-q', sound_file]
             elif self.player == 'paplay':
                 # PulseAudio player
                 volume_fraction = self.config.sound_volume / 100.0
@@ -131,15 +167,24 @@ class SoundPlayer:
                 self.logger.warning(f"Unknown player: {self.player}")
                 return
             
-            # Play sound in background (non-blocking)
-            subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
+            if self.blocking:
+                # Blocking playback (preferred for service hooks)
+                subprocess.run(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False
+                )
+            else:
+                # Non-blocking playback (preferred for interactive usage)
+                subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
             
-            self.logger.debug(f"Playing {sound_type} sound: {sound_file}")
+            self.logger.debug(f"Playing {sound_type} sound: {sound_file} (blocking={self.blocking})")
             
         except Exception as e:
             self.logger.error(f"Failed to play {sound_type} sound: {e}")

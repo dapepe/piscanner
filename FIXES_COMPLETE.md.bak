@@ -1,0 +1,87 @@
+# Color Correction - Complete Fix Summary
+
+## ✅ ALL ISSUES FIXED
+
+---
+
+## Problems Found
+
+### 1. Missing upload configuration in config.yaml
+**Status:** ✅ FIXED
+
+The `upload` section was only in `config.example.yaml`, not in the actual `config.yaml`.
+
+**Fix Applied:**
+```yaml
+# Added to config/config.yaml
+upload:
+  compression: "individual"
+  image_quality: 90
+  optimize_png: true
+```
+
+---
+
+### 2. scan.py not using Scanner class
+**Status:** ✅ FIXED
+
+The `scan.py` script had its own implementation that bypassed `Scanner` class completely.
+
+**Fix Applied:**
+- Rewrote `scan.py` to use `Scanner`, `Uploader`, and `Config` classes
+- Color correction now applied automatically (scanner.py:213)
+
+---
+
+### 3. Button scanning (ScanManager) not passing uploader to Scanner
+**Status:** ✅ FIXED
+
+The `ScanManager` in `cli.py` was creating Scanner without passing the uploader instance.
+
+**Fix Applied:**
+```python
+# piscan/cli.py line 103-106
+self.uploader = Uploader(self.config)
+self.scanner = Scanner(self.config, uploader=self.uploader)
+```
+
+---
+
+## Verification Tests
+
+### Test 1: Config Loading
+```bash
+$ python3 -c "from piscan.config import Config; c = Config('./config/config.yaml'); print(f'Color: {c.scanner_color_correction}, Compression: {c.upload_compression}')"
+
+Color: swap_rg, Compression: individual
+✅ Config loads correctly
+```
+
+### Test 2: Color Correction Function
+```bash
+$ python3 << 'EOF'
+from PIL import Image
+import tempfile, os
+from piscan.config import Config
+from piscan.scanner import Scanner
+from piscan.uploader import Uploader
+
+config = Config('./config/config.yaml')
+uploader = Uploader(config)
+scanner = Scanner(config, uploader=uploader)
+
+# Create red test image
+img = Image.new('RGB', (10, 10), (255, 0, 0))
+tmp = tempfile.mktemp(suffix='.png')
+img.save(tmp)
+
+# Apply correction
+scanner._apply_color_correction(tmp)
+
+# Check result
+result = Image.open(tmp).getpixel((5, 5))
+os.remove(tmp)
+
+print(f"Before: (255, 0, 0)")
+print(f"After: {result}")
+print("✅ swap_rg working: Red → Green" if result[1] == 255 else "❌ Not working")

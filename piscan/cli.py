@@ -100,10 +100,10 @@ class ScanManager:
         self.logger = Logger()
         
         # Initialize components
-        self.scanner = Scanner(self.config)
+        self.uploader = Uploader(self.config)
+        self.scanner = Scanner(self.config, uploader=self.uploader)
         self.file_manager = FileManager(self.config)
         self.blank_detector = BlankPageDetector(self.config)
-        self.uploader = Uploader(self.config)
         self.server = ScanServer(self.config, self)
         self.sound_player = SoundPlayer(self.config) if SoundPlayer else None
         
@@ -168,6 +168,68 @@ class ScanManager:
             
             # Create scan directory
             scan_dir = self.file_manager.create_scan_directory()
+
+            # ZIP upload mode: scan all pages first, then upload one ZIP.
+            if upload and self.config.upload_compression == 'zip':
+                self.logger.info("ZIP upload enabled; scanning all pages before upload")
+
+                scanned_files = self.scanner.scan_pages(scan_dir, source, page_callback=None)
+
+                # Skip blank pages if configured
+                if self.config.skip_blank:
+                    kept_files = []
+                    blank_files = []
+                    for filepath in scanned_files:
+                        try:
+                            if self.blank_detector.is_blank(filepath):
+                                blank_files.append(filepath)
+                            else:
+                                kept_files.append(filepath)
+                        except Exception as e:
+                            self.logger.warning(f"Blank detection failed for {filepath}: {e}")
+                            kept_files.append(filepath)
+
+                    if blank_files:
+                        self.logger.info(f"Removing {len(blank_files)} blank page(s)")
+                        self.blank_detector.remove_blank_files(blank_files)
+
+                    scanned_files = kept_files
+
+                if not scanned_files:
+                    raise Exception("No pages were scanned")
+
+                upload_result = self.uploader.upload_document(
+                    scanned_files,
+                    doc_id=doc_id,
+                    metadata=metadata,
+                    document_type=document_type,
+                    properties=properties,
+                )
+
+                if self.sound_player:
+                    self.sound_player.play_success()
+
+                if not keep_files:
+                    self.file_manager.cleanup_directory(scan_dir)
+                else:
+                    self.logger.info(f"Files kept in: {scan_dir}")
+
+                self.last_scan_info = {
+                    'timestamp': time.time(),
+                    'duration': time.time() - scan_start_time,
+                    'pages_scanned': len(scanned_files),
+                    'doc_id': upload_result.get('doc_id'),
+                    'success': True
+                }
+
+                return {
+                    'success': True,
+                    'pages': len(scanned_files),
+                    'duration': time.time() - scan_start_time,
+                    'files': scanned_files,
+                    'doc_id': upload_result.get('doc_id'),
+                    'upload_response': upload_result.get('response'),
+                }
             
             # Set up concurrent upload if enabled
             upload_result = {}
