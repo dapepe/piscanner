@@ -14,7 +14,8 @@ class Config:
             "resolution": 300,
             "mode": "Color",
             "source": "Auto",  # Auto, ADF, Flatbed
-            "format": "png"
+            "format": "png",
+            "color_correction": "none"  # none, swap_rb, swap_rg, bgr_to_rgb
         },
         "api": {
             "workspace": "default",
@@ -166,6 +167,11 @@ class Config:
     def scanner_format(self) -> str:
         """Get scanner output format."""
         return self.get('scanner.format')
+    
+    @property
+    def scanner_color_correction(self) -> str:
+        """Get scanner color correction mode."""
+        return self.get('scanner.color_correction', 'none')
     
     @property
     def api_workspace(self) -> str:

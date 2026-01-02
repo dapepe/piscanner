@@ -4,6 +4,7 @@ import subprocess
 import os
 import re
 from typing import List, Optional, Tuple
+from PIL import Image
 
 try:
     from .logger import Logger
@@ -39,6 +40,60 @@ class Scanner:
         self.config = config
         self.logger = Logger()
         self.device = self._get_device()
+    
+    def _apply_color_correction(self, file_path: str) -> None:
+        """Apply color correction to scanned image.
+        
+        Args:
+            file_path: Path to image file to correct
+        """
+        correction_mode = self.config.scanner_color_correction
+        
+        if correction_mode == "none" or not correction_mode:
+            return
+        
+        try:
+            # Open image
+            img = Image.open(file_path)
+            
+            # Only apply correction to color images
+            if img.mode not in ('RGB', 'RGBA'):
+                self.logger.debug(f"Skipping color correction for non-RGB image: {img.mode}")
+                return
+            
+            # Split channels
+            has_alpha = img.mode == 'RGBA'
+            if has_alpha:
+                r, g, b, a = img.split()
+            else:
+                r, g, b = img.split()
+                a = None
+            
+            # Apply correction based on mode
+            if correction_mode == "swap_rb" or correction_mode == "bgr_to_rgb":
+                # Swap red and blue channels (BGR -> RGB or RGB -> BGR)
+                corrected_channels = (b, g, r)
+                self.logger.debug(f"Applied swap_rb correction to {file_path}")
+            elif correction_mode == "swap_rg":
+                # Swap red and green channels
+                corrected_channels = (g, r, b)
+                self.logger.debug(f"Applied swap_rg correction to {file_path}")
+            else:
+                self.logger.warning(f"Unknown color correction mode: {correction_mode}")
+                return
+            
+            # Merge channels back
+            if has_alpha and a is not None:
+                corrected_img = Image.merge('RGBA', corrected_channels + (a,))
+            else:
+                corrected_img = Image.merge('RGB', corrected_channels)
+            
+            # Save corrected image (overwrite original)
+            corrected_img.save(file_path)
+            self.logger.debug(f"Color correction saved to {file_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to apply color correction to {file_path}: {e}")
     
     def _get_device(self) -> str:
         """Get scanner device string.
@@ -137,6 +192,10 @@ class Scanner:
                                         # Wait briefly to ensure file is fully written
                                         time.sleep(0.2)
                                         seen_files.add(filepath)
+                                        
+                                        # Apply color correction if configured
+                                        self._apply_color_correction(filepath)
+                                        
                                         scanned_files.append(filepath)
                                         page_num += 1
                                         self.logger.debug(f"Page {page_num} ready: {filepath}")
@@ -193,6 +252,10 @@ class Scanner:
                         scanned_files.append(os.path.join(output_dir, filename))
                 
                 scanned_files.sort()  # Ensure proper order
+                
+                # Apply color correction to all scanned files
+                for filepath in scanned_files:
+                    self._apply_color_correction(filepath)
             
             self.logger.info(f"Scanned {len(scanned_files)} pages")
             
