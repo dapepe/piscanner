@@ -24,24 +24,37 @@ class Scanner:
         self.device = self._get_device()
         self.uploader = uploader
     
-    def _apply_color_correction(self, file_path: str) -> None:
+    def _apply_color_correction(self, file_path: str, source: Optional[str] = None) -> None:
         """Apply color correction and optimization to scanned image.
         
         Args:
             file_path: Path to image file to correct
+            source: Source used for scanning (optional, for mirror logic)
         """
         correction_mode = self.config.scanner_color_correction
         optimize_png = self.config.upload_optimize_png
         image_quality = self.config.upload_image_quality
+        mirror_simplex = self.config.scanner_mirror_simplex
         
+        # Check if mirror logic is needed
+        should_mirror = False
+        if mirror_simplex and source and "front" in source.lower():
+            should_mirror = True
+
         # Skip if no correction needed and no optimization
-        if (correction_mode == "none" or not correction_mode) and not optimize_png:
+        if (correction_mode == "none" or not correction_mode) and not optimize_png and not should_mirror:
             return
         
         try:
             # Open image
             img = Image.open(file_path)
             needs_save = False
+
+            # Apply mirror flip if requested for simplex
+            if should_mirror:
+                img = img.transpose(0)  # 0 = Image.FLIP_LEFT_RIGHT
+                self.logger.debug(f"Applied mirror correction to {file_path}")
+                needs_save = True
             
             # Apply color correction to color images
             if correction_mode and correction_mode != "none" and img.mode in ('RGB', 'RGBA'):
@@ -176,8 +189,28 @@ class Scanner:
             '--mode', self.config.scanner_mode,
             '--source', actual_source,
             f'--format={self.config.scanner_format}',
-            f'--batch={os.path.join(output_dir, f"page_%03d.{format_ext}")}'
         ]
+
+        # Apply paper size / geometry
+        paper_size = self.config.scanner_paper_size
+        if paper_size:
+            ps = paper_size.upper()
+            if ps == "A4":
+                # Use slightly larger height (300mm) to ensure full page is captured
+                # as some scanners cut off the bottom margin.
+                # Also set page-width/height explicitly for drivers that require it.
+                cmd.extend(['--page-width', '210', '--page-height', '300', '-x', '210', '-y', '300'])
+            elif ps == "LETTER":
+                cmd.extend(['--page-width', '215.9', '--page-height', '279.4', '-x', '215.9', '-y', '279.4'])
+            elif ps == "LEGAL":
+                cmd.extend(['--page-width', '215.9', '--page-height', '355.6', '-x', '215.9', '-y', '355.6'])
+            # "Max" or "Auto" usually implies default driver behavior (no args)
+
+        # Disable swcrop to prevent auto-cropping footer
+        cmd.append('--swcrop=no')
+
+        # Output batch format
+        cmd.append(f'--batch={os.path.join(output_dir, f"page_%03d.{format_ext}")}')
         
         self.logger.info(f"Starting scan with source: {actual_source}")
         self.logger.debug(f"Scan command: {' '.join(cmd)}")
@@ -225,7 +258,7 @@ class Scanner:
                 wait_for_file_complete(filepath)
 
                 # Apply per-page post-processing right away
-                self._apply_color_correction(filepath)
+                self._apply_color_correction(filepath, source=actual_source)
 
                 scanned_files.append(filepath)
                 page_num = len(scanned_files)

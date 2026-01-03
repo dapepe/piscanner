@@ -10,13 +10,16 @@ class Config:
     
     DEFAULT_CONFIG = {
         "scanner": {
-            "device": "",  # Auto-detect if empty
-            "resolution": 300,
-            "mode": "Color",
-            "source": "Auto",  # Auto, ADF, Flatbed
-            "format": "png",
-            "color_correction": "none"  # none, swap_rb, swap_rg, swap_gb, rotate_left, rotate_right, bgr_to_rgb
+            "device": "",  # Scanner device identifier (e.g. "canon_dr:libusb:003:002")
+            "resolution": 300,  # DPI
+            "mode": "Color",  # Color, Gray, Lineart
+            "source": "ADF Duplex",  # Auto, ADF, Flatbed, ADF Front, ADF Duplex
+            "format": "png",  # png, jpeg, tiff
+            "color_correction": "none",  # none, swap_rb, swap_rg, swap_gb, rotate_left, rotate_right
+            "paper_size": "A4",  # A4, Letter, Max, or explicit geometry options
+            "mirror_simplex": False,  # Mirror image for simplex scans (ADF Front) if needed
         },
+
         "api": {
             "workspace": "default",
             "url": "http://localhost:8080",
@@ -47,10 +50,11 @@ class Config:
             "backup_count": 5
         },
         "sound": {
-            "enabled": False,  # Enable sound notifications
-            "success_sound": "/usr/share/sounds/freedesktop/stereo/complete.oga",  # Sound file for successful upload
-            "error_sound": "/usr/share/sounds/freedesktop/stereo/dialog-error.oga",  # Sound file for errors
+            "enabled": True,  # Enable sound notifications
+            "success_sound": "/opt/piscan/sounds/ds9_shuttle_beep.mp3",  # Sound file for successful upload
+            "error_sound": "/opt/piscan/sounds/computer_error.mp3",  # Sound file for errors
             "volume": 70,  # Volume percentage (0-100)
+
             "device": ""  # Optional ALSA/Pulse output device (e.g. "plughw:1,0" for USB)
         },
         "upload": {
@@ -192,11 +196,22 @@ class Config:
     
     @property
     def scanner_color_correction(self) -> str:
-        """Get scanner color correction mode."""
+        """Get color correction mode."""
         return self.get('scanner.color_correction', 'none')
-    
+
+    @property
+    def scanner_paper_size(self) -> str:
+        """Get paper size (e.g. A4, Letter)."""
+        return self.get('scanner.paper_size', 'A4')
+
+    @property
+    def scanner_mirror_simplex(self) -> bool:
+        """Mirror image for simplex scans."""
+        return self.get('scanner.mirror_simplex', False)
+
     @property
     def api_workspace(self) -> str:
+
         """Get API workspace."""
         return self.get('api.workspace')
     

@@ -13,6 +13,7 @@ from piscan.scanner import Scanner, ScannerError
 from piscan.uploader import Uploader, UploadError
 from piscan.file_manager import FileManager
 from piscan.blank_detector import BlankPageDetector
+from piscan.sound_player import SoundPlayer
 
 
 def _format_size(size_bytes: int) -> str:
@@ -27,6 +28,8 @@ def _format_size(size_bytes: int) -> str:
 
 def scan_document(config, source=None, format_type=None, debug=False):
     """Scan a document and upload to API."""
+    
+    sound_player = None
     
     if source:
         config.set('scanner.source', source)
@@ -49,6 +52,7 @@ def scan_document(config, source=None, format_type=None, debug=False):
         uploader = Uploader(config)
         scanner = Scanner(config, uploader=uploader)
         blank_detector = BlankPageDetector(config)
+        sound_player = SoundPlayer(config)
         
         if debug:
             print(f"Scanner device: {scanner.device}")
@@ -144,6 +148,7 @@ def scan_document(config, source=None, format_type=None, debug=False):
                 print(f"ZIP uploaded ({len(final_files)} pages, {bundles} bundle(s), ID: {doc_id})")
 
         print(f"Scan complete - {len(scanned_files)} pages processed")
+        sound_player.play_success()
         
         for filepath in scanned_files:
             if os.path.exists(filepath):
@@ -153,6 +158,8 @@ def scan_document(config, source=None, format_type=None, debug=False):
             
     except ScannerError as e:
         print(f"Error: {e}")
+        if sound_player:
+            sound_player.play_error()
         if debug:
             import traceback
             traceback.print_exc()
@@ -164,6 +171,8 @@ def scan_document(config, source=None, format_type=None, debug=False):
         
     except UploadError as e:
         print(f"Error: {e}")
+        if sound_player:
+            sound_player.play_error()
         if debug:
             import traceback
             traceback.print_exc()
@@ -183,6 +192,8 @@ def scan_document(config, source=None, format_type=None, debug=False):
         
     except Exception as e:
         print(f"Error: {e}")
+        if sound_player:
+            sound_player.play_error()
         if debug:
             import traceback
             traceback.print_exc()
