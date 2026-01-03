@@ -6,26 +6,33 @@ import sys
 import argparse
 from datetime import datetime
 
-# Add piscan module to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from piscan.config import Config
 from piscan.scanner import Scanner, ScannerError
 from piscan.uploader import Uploader, UploadError
 from piscan.file_manager import FileManager
-from piscan.sound_player import SoundPlayer
+from piscan.blank_detector import BlankPageDetector
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format byte size to human-readable string."""
+    size = float(size_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
 
 
 def scan_document(config, source=None, format_type=None, debug=False):
     """Scan a document and upload to API."""
     
-    # Override config with command-line arguments
     if source:
         config.set('scanner.source', source)
     if format_type:
         config.set('scanner.format', format_type)
     
-    # Create temp directory via FileManager (also runs retention cleanup)
     file_manager = FileManager(config)
     scan_dir = file_manager.create_scan_directory()
     
@@ -33,90 +40,111 @@ def scan_document(config, source=None, format_type=None, debug=False):
         print(f"Scan directory: {scan_dir}")
         print(f"Color correction: {config.scanner_color_correction}")
         print(f"Upload compression: {config.upload_compression}")
+        print(f"ZIP bundle size: {config.upload_zip_bundle_size}")
+        print(f"ZIP bundle max bytes: {config.upload_zip_bundle_max_bytes}")
+        print(f"Auto JPEG threshold: {config.upload_auto_jpeg_threshold}")
+        print(f"Auto JPEG page bytes: {config.upload_auto_jpeg_page_size_bytes}")
     
     try:
-        # Initialize components
         uploader = Uploader(config)
         scanner = Scanner(config, uploader=uploader)
-        # file_manager already created above to make scan_dir
+        blank_detector = BlankPageDetector(config)
         
         if debug:
             print(f"Scanner device: {scanner.device}")
             print(f"Scanner source: {config.scanner_source}")
             print(f"Scanner mode: {config.scanner_mode}")
         
-        sound_player = SoundPlayer(config)
-
         compression_mode = config.upload_compression
+        bundle_size = config.upload_zip_bundle_size
+        bundle_max_bytes = config.upload_zip_bundle_max_bytes
+
         if compression_mode == 'zip':
-            print("Scanning pages (ZIP upload at end)...")
+            if bundle_size > 0 or bundle_max_bytes > 0:
+                parts = []
+                if bundle_size > 0:
+                    parts.append(f"{bundle_size} pages")
+                if bundle_max_bytes > 0:
+                    parts.append(_format_size(bundle_max_bytes))
+                print(f"Scanning with ZIP bundling ({', '.join(parts)})...")
+            else:
+                print("Scanning pages (ZIP upload at end)...")
         else:
             print("Scanning and uploading pages as they complete...")
 
-        # Track upload progress
+        processed_files = []
         doc_id = None
         uploaded_pages = 0
-        
+
         def page_callback(page_num, file_path):
             """Called when each page is ready."""
             nonlocal doc_id, uploaded_pages
-            
+
             if debug:
                 print(f"[Callback] Page {page_num} ready: {file_path}")
-            
+
+            # Skip blank pages early (also removes the file)
+            if config.skip_blank and blank_detector.is_blank(file_path):
+                if debug:
+                    print(f"[Callback] Page {page_num} is blank, removing")
+                blank_detector.remove_blank_files([file_path])
+                return
+
+            file_size = os.path.getsize(file_path)
+            if debug:
+                print(f"[Callback] Page {page_num} size: {_format_size(file_size)}")
+
+            if compression_mode == 'zip':
+                processed_files.append(file_path)
+                return
+
+            # individual upload: create document with page 1 and append
             try:
                 if page_num == 1:
-                    # Create document with first page
                     result = uploader.upload_document([file_path])
                     doc_id = result.get('doc_id')
                     uploaded_pages = 1
-                    print(f"✓ Page 1 uploaded (Document ID: {doc_id})")
+                    print(f"Page 1 uploaded ({_format_size(file_size)}, ID: {doc_id})")
                 else:
-                    # Append page to existing document
-                    if doc_id:
-                        result = uploader._append_pages(doc_id, [file_path])
-                        uploaded_pages += 1
-                        print(f"✓ Page {page_num} uploaded")
-                    else:
-                        raise Exception("No document ID available for appending pages")
-                    
+                    if not doc_id:
+                        raise Exception("No document ID for appending")
+                    uploader._append_pages(doc_id, [file_path])
+                    uploaded_pages += 1
+                    print(f"Page {page_num} uploaded ({_format_size(file_size)})")
             except Exception as e:
                 print(f"Error uploading page {page_num}: {e}")
-                raise
-        
-        # Scan pages
-        if compression_mode == 'zip':
-            scanned_files = scanner.scan_pages(
-                scan_dir,
-                source=config.scanner_source,
-                page_callback=None
-            )
-        else:
-            scanned_files = scanner.scan_pages(
-                scan_dir,
-                source=config.scanner_source,
-                page_callback=page_callback
-            )
-        
+
+        scanned_files = scanner.scan_pages(
+            scan_dir,
+            source=config.scanner_source,
+            page_callback=page_callback,
+        )
+
         if debug:
-            print(f"\n[Scan] Total pages scanned: {len(scanned_files)}")
-        
+            print(f"[Scan] Total pages scanned: {len(scanned_files)}")
+
         if not scanned_files:
-            print("Error: No pages were scanned. Please load paper in the document feeder.")
+            print("Error: No pages scanned. Load paper in feeder.")
             sys.exit(1)
-        
-        # If ZIP mode, upload once at the end
+
         if compression_mode == 'zip':
-            result = uploader.upload_document(scanned_files)
+            final_files = processed_files
+            if not final_files:
+                print("Error: All pages were blank or removed.")
+                sys.exit(1)
+
+            print(f"Uploading {len(final_files)} pages as ZIP...")
+            result = uploader.upload_document(final_files)
             doc_id = result.get('doc_id')
-            print(f"✓ Uploaded ZIP (Document ID: {doc_id})")
+            bundles = result.get('bundles', 1)
+            payload = result.get('payload_human')
+            if payload:
+                print(f"ZIP uploaded ({len(final_files)} pages, {bundles} bundle(s), {payload}, ID: {doc_id})")
+            else:
+                print(f"ZIP uploaded ({len(final_files)} pages, {bundles} bundle(s), ID: {doc_id})")
 
-        print(f"\n✓ Scan and upload complete - {len(scanned_files)} pages processed")
-
-        # Play success sound after transfer completes
-        sound_player.play_success()
+        print(f"Scan complete - {len(scanned_files)} pages processed")
         
-        # Clean up
         for filepath in scanned_files:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -128,10 +156,9 @@ def scan_document(config, source=None, format_type=None, debug=False):
         if debug:
             import traceback
             traceback.print_exc()
-        # Clean up
         if os.path.exists(scan_dir):
-            for filename in os.listdir(scan_dir):
-                os.remove(os.path.join(scan_dir, filename))
+            for f in os.listdir(scan_dir):
+                os.remove(os.path.join(scan_dir, f))
             os.rmdir(scan_dir)
         sys.exit(1)
         
@@ -140,19 +167,17 @@ def scan_document(config, source=None, format_type=None, debug=False):
         if debug:
             import traceback
             traceback.print_exc()
-        # Clean up
         if os.path.exists(scan_dir):
-            for filename in os.listdir(scan_dir):
-                os.remove(os.path.join(scan_dir, filename))
+            for f in os.listdir(scan_dir):
+                os.remove(os.path.join(scan_dir, f))
             os.rmdir(scan_dir)
         sys.exit(1)
         
     except KeyboardInterrupt:
         print("\nCancelled")
-        # Clean up
         if os.path.exists(scan_dir):
-            for filename in os.listdir(scan_dir):
-                os.remove(os.path.join(scan_dir, filename))
+            for f in os.listdir(scan_dir):
+                os.remove(os.path.join(scan_dir, f))
             os.rmdir(scan_dir)
         sys.exit(1)
         
@@ -161,10 +186,9 @@ def scan_document(config, source=None, format_type=None, debug=False):
         if debug:
             import traceback
             traceback.print_exc()
-        # Clean up
         if os.path.exists(scan_dir):
-            for filename in os.listdir(scan_dir):
-                os.remove(os.path.join(scan_dir, filename))
+            for f in os.listdir(scan_dir):
+                os.remove(os.path.join(scan_dir, f))
             os.rmdir(scan_dir)
         sys.exit(1)
 

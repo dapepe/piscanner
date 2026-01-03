@@ -174,23 +174,46 @@ fi
 
 cp -r /etc/sane.d/* /etc/scanbd/sane.d/ 2>/dev/null || true
 
-# Restore real backends for scanbd
-print_info "Configuring scanbd to use real scanner backends..."
+    # Restore real backends for scanbd
+    print_info "Configuring scanbd to use real scanner backends..."
 
-# Detect which backend to use
-BACKEND=$(echo "$SCANNER_DEVICE" | cut -d':' -f1)
-print_info "Detected backend: $BACKEND"
+    # Detect which backend to use
+    # scanimage -L might return multiple lines. We want the backend of the *selected*
+    # scanner, but if that's empty, we try to guess from the first available non-network scanner.
+    
+    # Clean up SCANNER_DEVICE (take first word before colon)
+    # Example: "canon_dr:libusb:003:002" -> "canon_dr"
+    SCANBD_BACKEND="$(echo "${SCANNER_DEVICE:-}" | head -n1 | cut -d':' -f1)"
+    
+    # Fallback if empty or if it looks like a network prefix
+    if [ -z "$SCANBD_BACKEND" ] || [ "$SCANBD_BACKEND" = "net" ] || [ "$SCANBD_BACKEND" = "airscan" ]; then
+         SCANBD_BACKEND="canon_dr"
+    fi
 
-cat > /etc/scanbd/sane.d/dll.conf << EOF
+    print_info "Detected backend for scanbd: $SCANBD_BACKEND"
+
+    cat > /etc/scanbd/sane.d/dll.conf << EOF
 # Piscan: scanbd uses real backends directly
-$BACKEND
+$SCANBD_BACKEND
 
 # Do NOT use net backend here - that's for normal applications
 EOF
 
-print_success "Updated /etc/scanbd/sane.d/dll.conf"
+    print_success "Updated /etc/scanbd/sane.d/dll.conf"
 
-# Step 6: Get Piscan server details
+    # Configure environment for scanbd service
+    print_info "Configuring /etc/default/scanbd..."
+    
+    # Ensure scanbd uses its own config dir, not system default
+    if grep -q "SANE_CONFIG_DIR" /etc/default/scanbd 2>/dev/null; then
+        sed -i 's|^.*SANE_CONFIG_DIR=.*|export SANE_CONFIG_DIR=/etc/scanbd/sane.d|' /etc/default/scanbd
+    else
+        echo 'export SANE_CONFIG_DIR=/etc/scanbd/sane.d' >> /etc/default/scanbd
+    fi
+    print_success "Updated /etc/default/scanbd"
+
+    # Step 6: Get Piscan server details
+
 print_header "Step 6: Piscan Server Configuration"
 
 PISCAN_PORT=5000
@@ -201,28 +224,79 @@ fi
 
 PISCAN_URL="http://localhost:$PISCAN_PORT/scan"
 print_info "Will trigger scans at: $PISCAN_URL"
+print_info "Button action will run /opt/piscan/scan.py and log to /var/log/scanbd-scan.log"
 
 # Step 7: Create scan trigger script
 print_header "Step 7: Create Button Trigger Script"
 
 print_info "Creating /etc/scanbd/scan.sh..."
 
-cat > /etc/scanbd/scan.sh << EOF
+cat > /etc/scanbd/scan.sh << 'EOF'
 #!/bin/bash
-# Piscan: Trigger scan via HTTP API when button is pressed
+# Piscan: scanbd action script
+# Runs the same piscan Python pipeline used by CLI/service.
 
-# Log the event
-logger -t "scanbd" "Scan button pressed (action: \$SCANBD_ACTION, device: \$SCANBD_DEVICE)"
+set -eo pipefail
 
-# Trigger piscan scan
-curl -X POST -H "Content-Type: application/json" \\
-     -d '{"source": "button"}' \\
-     "$PISCAN_URL" \\
-     2>&1 | logger -t "scanbd"
+PYTHON_BIN="/usr/bin/python3"
+LOG_FILE_DEFAULT="/var/log/scanbd-scan.log"
+LOG_FILE="${PISCAN_SCANBD_LOG:-$LOG_FILE_DEFAULT}"
+CONFIG_PATH="${PISCAN_CONFIG:-/opt/piscan/config/config.yaml}"
+SCAN_SCRIPT="/opt/piscan/scan.py"
+
+# If /var/log isn't writable by the scanbd user, fall back
+# to /tmp to avoid breaking button scans completely.
+if ! touch "$LOG_FILE" 2>/dev/null; then
+  LOG_FILE="/tmp/scanbd-scan.log"
+  touch "$LOG_FILE" 2>/dev/null || true
+fi
+
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE" 2>/dev/null || logger -t "scanbd" "$*" || true
+}
+
+log "=== Scan button pressed - starting scan ==="
+log "Config: $CONFIG_PATH"
+log "scanbd: action=${SCANBD_ACTION:-unknown} device=${SCANBD_DEVICE:-unknown}"
+
+if [ ! -x "$SCAN_SCRIPT" ]; then
+  log "ERROR: Missing scan script: $SCAN_SCRIPT"
+  exit 1
+fi
+
+if [ ! -x "$PYTHON_BIN" ]; then
+  log "ERROR: Missing python binary: $PYTHON_BIN"
+  exit 1
+fi
+
+# Run scan script (includes ZIP bundling + payload size logs)
+# --debug prints key config (no secrets) into the scanbd log.
+set +e
+"$PYTHON_BIN" "$SCAN_SCRIPT" --config "$CONFIG_PATH" --debug 2>&1 | while IFS= read -r line; do
+  log "$line"
+done
+rc=${PIPESTATUS[0]}
+set -e
+
+if [ "$rc" -eq 0 ]; then
+  log "✓ Scan completed successfully"
+else
+  log "ERROR: Scan failed (exit=$rc)"
+fi
+
+log "=== Scan complete ==="
+exit "$rc"
 EOF
 
 chmod +x /etc/scanbd/scan.sh
+
+# Make sure the primary scan log exists and is writable.
+# scanbd typically runs as a non-root user, so fix this during setup.
+touch /var/log/scanbd-scan.log
+chmod 666 /var/log/scanbd-scan.log
+
 print_success "Created /etc/scanbd/scan.sh"
+print_success "Prepared /var/log/scanbd-scan.log (chmod 666)"
 
 # Step 8: Configure scanbd actions
 print_header "Step 8: Configure Button Actions"
@@ -242,64 +316,92 @@ else
 fi
 
 if [ "$CONFIGURE_SCANBD" = true ]; then
-    # Backup and create new scanbd.conf with scan action
-    cat > /etc/scanbd/scanbd.conf << 'EOF'
-/*
- * Piscan scanbd configuration
- * Generated by setup-button.sh
- */
+    # Backup and create new scanbd.conf.
+    # IMPORTANT: scanbd triggers are usually device-specific (option names differ
+    # between backends), so we create a dedicated piscan device definition.
 
+    # Determine backend prefix for scanbd device filter.
+    # scanimage -L might return multiple lines. We want the backend of the *selected*
+    # scanner, but if that's empty, we try to guess from the first available non-network scanner.
+    
+    # Clean up SCANNER_DEVICE (take first word before colon)
+    # Example: "canon_dr:libusb:003:002" -> "canon_dr"
+    SCANBD_BACKEND="$(echo "${SCANNER_DEVICE:-}" | head -n1 | cut -d':' -f1)"
+    
+    # Fallback if empty
+    if [ -z "$SCANBD_BACKEND" ]; then
+         SCANBD_BACKEND="canon_dr"
+    fi
+
+
+    # Ensure our device definition exists.
+    mkdir -p /etc/scanbd/scanner.d
+
+    cat > /etc/scanbd/scanner.d/piscan.conf << EOF
+# Piscan scanbd device mapping
+# Auto-generated by setup-button.sh
+
+device piscan {
+    filter = "^${SCANBD_BACKEND}.*"  # backend prefix (regex)
+    desc   = "Piscan button trigger"
+
+    # Canon DR-series commonly exposes button options like:
+    # start, stop, button-1, button-2, button-3
+    # We trigger on any change in these options.
+    action scan {
+        filter = "^(start|button-[0-9]+|scan)$"
+        desc   = "Scan to piscan"
+        script = "/etc/scanbd/scan.sh"
+    }
+}
+EOF
+
+    cat > /etc/scanbd/scanbd.conf << 'EOF'
+# Piscan scanbd configuration
+# Generated by setup-button.sh
+
+# Keep debug enabled for initial setup; lower later if desired.
 global {
     debug   = true
     debug-level = 7
-    
+
     user    = saned
     group   = scanner
-    
-    saned   = "/usr/sbin/saned"
+
+    saned      = "/usr/sbin/saned"
     saned_opt  = {}
     saned_env  = { "SANE_CONFIG_DIR=/etc/scanbd/sane.d" }
-    
+
     scriptdir = /etc/scanbd
-    
-    timeout = 500
-    
-    pidfile = "/var/run/scanbd.pid"
-    
+    timeout   = 500
+    pidfile   = "/var/run/scanbd.pid"
+
     environment {
         device = "SCANBD_DEVICE"
         action = "SCANBD_ACTION"
     }
-    
+
     multiple_actions = true
-    
-    action scan {
-        filter = "^scan.*"
-        numerical-trigger {
-            from-value = 1
-            to-value   = 0
-        }
-        desc   = "Scan to piscan"
-        script = "/etc/scanbd/scan.sh"
-    }
-    
-    # Catch-all for testing other buttons
-    action test {
-        filter = "^.*"
-        numerical-trigger {
-            from-value = 1
-            to-value   = 0
-        }
-        desc   = "Test button"
-        script = "/etc/scanbd/test.script"
-    }
 }
 
-# Include device-specific configurations
-include(scanner.d)
+# Device configurations
 EOF
 
+    # Always include our piscan mapping first.
+    echo "include(scanner.d/piscan.conf)" >> /etc/scanbd/scanbd.conf
+
+    # Append include() lines for other available scanner.d configs.
+    for f in /etc/scanbd/scanner.d/*.conf; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        if [ "$base" = "piscan.conf" ]; then
+            continue
+        fi
+        echo "include(scanner.d/$base)" >> /etc/scanbd/scanbd.conf
+    done
+
     print_success "Updated /etc/scanbd/scanbd.conf"
+    print_success "Created /etc/scanbd/scanner.d/piscan.conf (backend: $SCANBD_BACKEND)"
 else
     print_info "Skipped scanbd.conf update"
 fi

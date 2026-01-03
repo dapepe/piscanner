@@ -13,10 +13,10 @@ class Logger:
     def debug(self, msg, *args): print(f"DEBUG: {msg % args}")
     def warning(self, msg, *args): print(f"WARNING: {msg % args}")
 
-Flask = None
-request = None
-jsonify = None
-Response = None
+Flask: Any = None
+request: Any = None
+jsonify: Any = None
+Response: Any = None
 
 try:
     from flask import Flask, request, jsonify, Response
@@ -178,6 +178,17 @@ class ScanServer:
                     'processing': {
                         'skip_blank': self.config.skip_blank,
                         'blank_threshold': self.config.blank_threshold
+                    },
+                    'upload': {
+                        'compression': self.config.upload_compression,
+                        'image_quality': self.config.upload_image_quality,
+                        'optimize_png': self.config.upload_optimize_png,
+                        'zip_bundle_size': self.config.upload_zip_bundle_size,
+                        'zip_bundle_max_bytes': self.config.upload_zip_bundle_max_bytes,
+                        'zip_compression_level': self.config.upload_zip_compression_level,
+                        'auto_jpeg_threshold': self.config.upload_auto_jpeg_threshold,
+                        'auto_jpeg_page_size_bytes': self.config.upload_auto_jpeg_page_size_bytes,
+                        'max_image_dimension': self.config.upload_max_image_dimension,
                     },
                     'server': {
                         'host': self.config.server_host,

@@ -5,34 +5,28 @@ import os
 import zipfile
 import tempfile
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, cast
+from PIL import Image
+
+from .logger import Logger as PiScanLogger
 
 try:
-    from .logger import Logger
-except ImportError:
-    # Simple logger fallback - silent unless debug enabled
-    import os
-    _debug_enabled = os.environ.get('PISCAN_DEBUG', '').lower() in ('1', 'true', 'yes')
-    
-    class Logger:
-        def info(self, msg, *args):
-            if _debug_enabled:
-                print(f"INFO: {msg % args if args else msg}")
-        def error(self, msg, *args):
-            if _debug_enabled:
-                print(f"ERROR: {msg % args if args else msg}")
-        def debug(self, msg, *args):
-            if _debug_enabled:
-                print(f"DEBUG: {msg % args if args else msg}")
-        def warning(self, msg, *args):
-            if _debug_enabled:
-                print(f"WARNING: {msg % args if args else msg}")
-
-try:
-    import requests
+    import requests as _requests
 except ImportError:
     print("Warning: requests not available. HTTP upload will be disabled.")
-    requests = None
+    _requests = None
+
+requests = cast(Any, _requests)
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format byte size to human-readable string."""
+    size = float(size_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
 
 
 class Uploader:
@@ -45,7 +39,7 @@ class Uploader:
             config: Configuration object
         """
         self.config = config
-        self.logger = Logger()
+        self.logger = PiScanLogger()
         self.enabled = requests is not None
         
         if not self.enabled:
@@ -112,37 +106,191 @@ class Uploader:
         except Exception as e:
             self.logger.warning(f"Failed to log error to API: {e}")
     
-    def _compress_to_zip(self, image_files: List[str]) -> str:
+    def _compress_to_zip(self, image_files: List[str], compression_level: int = 6) -> str:
         """Compress image files to a ZIP archive.
         
         Args:
             image_files: List of image file paths
+            compression_level: ZIP compression level (1-9)
             
         Returns:
             Path to created ZIP file
         """
-        # Create temporary ZIP file
+        if not image_files:
+            raise UploadError("No files to compress")
+
         temp_zip = tempfile.NamedTemporaryFile(mode='w+b', suffix='.zip', delete=False)
         zip_path = temp_zip.name
         temp_zip.close()
         
         try:
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=compression_level) as zipf:
                 for image_file in image_files:
                     if os.path.exists(image_file):
                         arcname = os.path.basename(image_file)
                         zipf.write(image_file, arcname=arcname)
                         self.logger.debug(f"Added {arcname} to ZIP")
             
-            self.logger.info(f"Created ZIP archive: {zip_path} ({len(image_files)} files)")
+            total_size = os.path.getsize(zip_path)
+            self.logger.info(f"Created ZIP: {zip_path} ({len(image_files)} files, {_format_size(total_size)})")
             return zip_path
             
         except Exception as e:
-            # Clean up on error
             if os.path.exists(zip_path):
                 os.remove(zip_path)
             raise UploadError(f"Failed to create ZIP archive: {e}")
     
+    def _optimize_image(self, file_path: str) -> Optional[str]:
+        """Optimize image for size reduction.
+        
+        Args:
+            file_path: Path to image file
+            
+        Returns:
+            Path to optimized file (same as input if no changes made)
+        """
+        max_dim = self.config.upload_max_image_dimension
+        if max_dim <= 0:
+            return file_path
+        
+        try:
+            img = Image.open(file_path)
+            width, height = img.size
+            
+            if width <= max_dim and height <= max_dim:
+                return file_path
+            
+            ratio = min(max_dim / width, max_dim / height)
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            
+            self.logger.debug(f"Resizing {file_path} from {width}x{height} to {new_width}x{new_height}")
+            
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+            file_ext = os.path.splitext(file_path.lower())[1]
+            save_kwargs: Dict[str, Any] = {'optimize': True}
+            if file_ext in ('.jpg', '.jpeg'):
+                save_kwargs.update({
+                    'quality': self.config.upload_image_quality,
+                    'progressive': True,
+                    'subsampling': 2,
+                })
+
+            img.save(file_path, **save_kwargs)
+            
+            return file_path
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to optimize {file_path}: {e}")
+            return file_path
+    
+    def _convert_to_jpeg(self, file_path: str) -> Optional[str]:
+        """Convert image to JPEG for better compression.
+        
+        Args:
+            file_path: Path to image file
+            
+        Returns:
+            Path to JPEG file (same name but .jpg extension)
+        """
+        try:
+            img = Image.open(file_path)
+            
+            if img.mode in ('RGBA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            jpeg_path = os.path.splitext(file_path)[0] + '.jpg'
+            img.save(
+                jpeg_path,
+                quality=self.config.upload_image_quality,
+                optimize=True,
+                progressive=True,
+                subsampling=2,
+            )
+            
+            self.logger.debug(f"Converted {file_path} to {jpeg_path}")
+            
+            if file_path != jpeg_path and os.path.exists(file_path):
+                os.remove(file_path)
+            
+            return jpeg_path
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to convert {file_path} to JPEG: {e}")
+            return file_path
+    
+    def _file_size_bytes(self, file_path: str) -> int:
+        try:
+            return os.path.getsize(file_path)
+        except OSError:
+            return 0
+
+    def _payload_size_bytes(self, file_paths: List[str]) -> int:
+        return sum(self._file_size_bytes(path) for path in file_paths)
+
+    def _prepare_file_for_zip(
+        self,
+        file_path: str,
+        total_pages: int,
+        auto_jpeg_threshold: int,
+        auto_jpeg_page_size_bytes: int,
+    ) -> str:
+        """Prepare a single page file for ZIP upload."""
+        should_force_jpeg = auto_jpeg_threshold > 0 and total_pages >= auto_jpeg_threshold
+
+        if not should_force_jpeg and auto_jpeg_page_size_bytes > 0:
+            try:
+                should_force_jpeg = self._file_size_bytes(file_path) >= auto_jpeg_page_size_bytes
+            except OSError:
+                should_force_jpeg = False
+
+        if should_force_jpeg:
+            optimized = self._convert_to_jpeg(file_path)
+        else:
+            optimized = self._optimize_image(file_path)
+
+        return str(optimized)
+
+    def _build_zip_bundles(
+        self,
+        prepared_files: List[str],
+        bundle_size: int,
+        bundle_max_bytes: int,
+    ) -> List[List[str]]:
+        """Split prepared files into bundles by page count and/or bytes."""
+        bundles: List[List[str]] = []
+        current_bundle: List[str] = []
+        current_bytes = 0
+
+        for file_path in prepared_files:
+            file_bytes = self._file_size_bytes(file_path)
+
+            should_split = False
+            if current_bundle and bundle_size > 0 and len(current_bundle) >= bundle_size:
+                should_split = True
+            if current_bundle and bundle_max_bytes > 0 and current_bytes + file_bytes > bundle_max_bytes:
+                should_split = True
+
+            if should_split:
+                bundles.append(current_bundle)
+                current_bundle = []
+                current_bytes = 0
+
+            current_bundle.append(file_path)
+            current_bytes += file_bytes
+
+        if current_bundle:
+            bundles.append(current_bundle)
+
+        return bundles
+
     def upload_document(self, image_files: List[str], doc_id: Optional[str] = None,
                        metadata: Optional[Dict[str, Any]] = None,
                        document_type: Optional[str] = None,
@@ -150,6 +298,7 @@ class Uploader:
         """Upload scanned document to API.
         
         Strategy: Create document with first page, then append remaining pages one by one.
+        When ZIP compression is enabled, supports bundling multiple pages per ZIP.
         
         Args:
             image_files: List of image file paths to upload
@@ -170,38 +319,217 @@ class Uploader:
         if not image_files:
             raise UploadError("No files to upload")
         
-        # Check if ZIP compression is enabled
         compression_mode = self.config.upload_compression
         
         if compression_mode == "zip":
-            # Always ZIP when enabled (even for single-page scans)
-            
-            self.logger.info(f"Creating ZIP archive for {len(image_files)} pages")
-            try:
-                zip_path = self._compress_to_zip(image_files)
-                # Upload ZIP as single file
-                result = self._create_document(
-                    [zip_path],
-                    doc_id=doc_id,
-                    metadata=metadata,
-                    document_type=document_type,
-                    properties=properties
+            bundle_size = self.config.upload_zip_bundle_size
+            bundle_max_bytes = self.config.upload_zip_bundle_max_bytes
+            auto_jpeg_threshold = self.config.upload_auto_jpeg_threshold
+            auto_jpeg_page_size_bytes = self.config.upload_auto_jpeg_page_size_bytes
+
+            if auto_jpeg_threshold <= 0 and auto_jpeg_page_size_bytes <= 0:
+                if any(path.lower().endswith('.png') for path in image_files):
+                    self.logger.info(
+                        "PNG pages usually compress poorly in ZIP; consider 'scanner.format: jpeg' "
+                        "or set upload.auto_jpeg_threshold / upload.auto_jpeg_page_size_bytes"
+                    )
+
+            # If any bundling limit is configured, always go through the bundled
+            # code path (it may still produce a single bundle).
+            if bundle_size > 0 or bundle_max_bytes > 0:
+                return self._upload_bundled_zip(
+                    image_files,
+                    doc_id,
+                    metadata,
+                    document_type,
+                    properties,
+                    bundle_size=bundle_size,
+                    bundle_max_bytes=bundle_max_bytes,
+                    auto_jpeg_threshold=auto_jpeg_threshold,
+                    auto_jpeg_page_size_bytes=auto_jpeg_page_size_bytes,
                 )
-                # Clean up ZIP file
+
+            return self._upload_single_zip(
+                image_files,
+                doc_id,
+                metadata,
+                document_type,
+                properties,
+                auto_jpeg_threshold=auto_jpeg_threshold,
+                auto_jpeg_page_size_bytes=auto_jpeg_page_size_bytes,
+            )
+        
+        return self._upload_incremental(image_files, doc_id, metadata, document_type, properties)
+    
+    def _upload_single_zip(
+        self,
+        image_files: List[str],
+        doc_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        document_type: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+        auto_jpeg_threshold: int = 0,
+        auto_jpeg_page_size_bytes: int = 0,
+    ) -> Dict[str, Any]:
+        """Upload files as a single ZIP archive."""
+        self.logger.info(f"Creating ZIP archive for {len(image_files)} pages")
+
+        optimized_files: List[str] = []
+        try:
+            total_pages = len(image_files)
+            for filepath in image_files:
+                optimized_files.append(
+                    self._prepare_file_for_zip(
+                        filepath,
+                        total_pages=total_pages,
+                        auto_jpeg_threshold=auto_jpeg_threshold,
+                        auto_jpeg_page_size_bytes=auto_jpeg_page_size_bytes,
+                    )
+                )
+
+            compression_level = self.config.upload_zip_compression_level
+            zip_path = self._compress_to_zip(optimized_files, compression_level)
+
+            zip_size = self._file_size_bytes(zip_path)
+            self.logger.info(f"ZIP payload size: {_format_size(zip_size)} ({len(optimized_files)} pages)")
+
+            result = self._create_document(
+                [zip_path],
+                doc_id=doc_id,
+                metadata=metadata,
+                document_type=document_type,
+                properties=properties,
+            )
+
+            result.update({
+                'payload_bytes': zip_size,
+                'payload_human': _format_size(zip_size),
+                'bundles': 1,
+            })
+
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Failed to upload ZIP: {e}"
+            self.logger.error(error_msg)
+            self.log_error(error_msg, level="error", details={"file_count": len(image_files)})
+            raise UploadError(error_msg)
+    
+    def _upload_bundled_zip(
+        self,
+        image_files: List[str],
+        doc_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        document_type: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+        bundle_size: int = 0,
+        bundle_max_bytes: int = 0,
+        auto_jpeg_threshold: int = 0,
+        auto_jpeg_page_size_bytes: int = 0,
+    ) -> Dict[str, Any]:
+        """Upload files as one or more ZIP bundles."""
+        total_pages = len(image_files)
+
+        limits = []
+        if bundle_size > 0:
+            limits.append(f"{bundle_size} page(s)")
+        if bundle_max_bytes > 0:
+            limits.append(f"{_format_size(bundle_max_bytes)}")
+        limits_str = ", ".join(limits) if limits else "unlimited"
+
+        self.logger.info(f"ZIP bundling enabled ({limits_str}) for {total_pages} page(s)")
+
+        prepared_files: List[str] = []
+        for filepath in image_files:
+            prepared_files.append(
+                self._prepare_file_for_zip(
+                    filepath,
+                    total_pages=total_pages,
+                    auto_jpeg_threshold=auto_jpeg_threshold,
+                    auto_jpeg_page_size_bytes=auto_jpeg_page_size_bytes,
+                )
+            )
+
+        bundles = self._build_zip_bundles(prepared_files, bundle_size=bundle_size, bundle_max_bytes=bundle_max_bytes)
+        compression_level = self.config.upload_zip_compression_level
+
+        created_doc_id: Optional[str] = None
+        total_pages_uploaded = 0
+        bundle_payload_bytes: List[int] = []
+
+        for bundle_num, bundle_files in enumerate(bundles, start=1):
+            self.logger.info(f"Processing bundle {bundle_num}/{len(bundles)} ({len(bundle_files)} pages)")
+
+            zip_path = self._compress_to_zip(bundle_files, compression_level)
+            zip_size = self._file_size_bytes(zip_path)
+            bundle_payload_bytes.append(zip_size)
+
+            self.logger.info(f"Bundle {bundle_num} payload: {_format_size(zip_size)}")
+            if bundle_max_bytes > 0 and zip_size > bundle_max_bytes:
+                self.logger.warning(
+                    f"Bundle {bundle_num} exceeds zip_bundle_max_bytes ({_format_size(zip_size)} > {_format_size(bundle_max_bytes)})"
+                )
+
+            try:
+                if bundle_num == 1:
+                    result = self._create_document(
+                        [zip_path],
+                        doc_id=doc_id,
+                        metadata=metadata,
+                        document_type=document_type,
+                        properties=properties,
+                    )
+                    created_doc_id = result.get('doc_id')
+                    if created_doc_id:
+                        self.logger.info(f"Document created: {created_doc_id}")
+                    pages_added = result.get('pages_added', len(bundle_files))
+                else:
+                    if not created_doc_id:
+                        raise UploadError("Missing document ID for bundle append")
+                    result = self._append_pages(str(created_doc_id), [zip_path])
+                    pages_added = result.get('pages_added', len(bundle_files))
+
+                total_pages_uploaded += pages_added
+
+            except Exception as e:
+                error_msg = f"Failed to upload bundle {bundle_num}: {e}"
+                self.logger.error(error_msg)
+                self.log_error(error_msg, level="error", details={"bundle": bundle_num, "files": len(bundle_files)})
+                raise UploadError(error_msg)
+            finally:
                 if os.path.exists(zip_path):
                     os.remove(zip_path)
-                return result
-            except Exception as e:
-                error_msg = f"Failed to upload ZIP: {e}"
-                self.logger.error(error_msg)
-                self.log_error(error_msg, level="error", details={"file_count": len(image_files)})
-                raise UploadError(error_msg)
-        
+
+        total_payload = sum(bundle_payload_bytes)
+        self.logger.info(
+            f"All bundles uploaded: {total_pages_uploaded} pages ({len(bundles)} bundle(s), {_format_size(total_payload)})"
+        )
+
+        return {
+            'success': True,
+            'doc_id': created_doc_id,
+            'pages_added': total_pages_uploaded,
+            'total_pages': total_pages_uploaded,
+            'bundles': len(bundles),
+            'bundle_payload_bytes': bundle_payload_bytes,
+            'total_payload_bytes': total_payload,
+            'payload_bytes': total_payload,
+            'payload_human': _format_size(total_payload),
+        }
+    
+    def _upload_incremental(self, image_files: List[str], doc_id: Optional[str] = None,
+                           metadata: Optional[Dict[str, Any]] = None,
+                           document_type: Optional[str] = None,
+                           properties: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Upload files incrementally page by page."""
         self.logger.info(f"Uploading {len(image_files)} pages incrementally")
         
-        # Step 1: Create document with first page
         first_page = image_files[0]
-        self.logger.info(f"Creating document with first page: {first_page}")
+        first_size = os.path.getsize(first_page)
+        self.logger.info(f"First page payload: {_format_size(first_size)}")
         
         result = self._create_document(
             [first_page],
@@ -211,7 +539,6 @@ class Uploader:
             properties=properties
         )
         
-        # Extract document ID from response
         created_doc_id = result.get('doc_id')
         if not created_doc_id:
             raise UploadError("Failed to get document ID from create response")
@@ -220,17 +547,16 @@ class Uploader:
         
         total_pages_added = result.get('pages_added', 1)
         
-        # Step 2: Append remaining pages one by one
         if len(image_files) > 1:
             for i, page_file in enumerate(image_files[1:], start=2):
-                self.logger.info(f"Appending page {i}/{len(image_files)}: {page_file}")
+                page_size = os.path.getsize(page_file)
+                self.logger.info(f"Appending page {i}/{len(image_files)}: {_format_size(page_size)}")
                 
                 append_result = self._append_pages(created_doc_id, [page_file])
                 total_pages_added += append_result.get('pages_added', 1)
                 
-                self.logger.info(f"Page {i} appended successfully. Total pages: {append_result.get('total_pages', total_pages_added)}")
+                self.logger.info(f"Page {i} appended. Total pages: {append_result.get('total_pages', total_pages_added)}")
         
-        # Return final result
         return {
             'success': True,
             'response': result.get('response'),
@@ -261,17 +587,23 @@ class Uploader:
         # Build API URL
         # Format: {base_url}/{workspace}/api/document/
         api_url = f"{self.config.api_url}/{self.config.api_workspace}/api/document/"
-        
+
         # Prepare files for multipart upload
         files = []
         try:
+            payload_bytes = 0
+
             for image_file in image_files:
                 if not os.path.exists(image_file):
                     self.logger.warning(f"File not found, skipping: {image_file}")
                     continue
-                
+
                 filename = os.path.basename(image_file)
                 content_type = self._guess_mime_type(image_file)
+                size_bytes = self._file_size_bytes(image_file)
+                payload_bytes += size_bytes
+
+                self.logger.debug(f"Payload file: {filename} ({_format_size(size_bytes)})")
                 files.append(('files', (filename, open(image_file, 'rb'), content_type)))
             
             if not files:
@@ -291,6 +623,10 @@ class Uploader:
             if self.config.api_token:
                 headers['Authorization'] = f'Bearer {self.config.api_token}'
             
+            self.logger.info(
+                f"Uploading payload: {len(files)} file(s), {_format_size(payload_bytes)} -> {api_url}"
+            )
+
             # Make request
             response = requests.post(  # type: ignore
                 api_url,
@@ -356,17 +692,23 @@ class Uploader:
         # Build API URL
         # Format: {base_url}/{workspace}/api/document/{docId}
         api_url = f"{self.config.api_url}/{self.config.api_workspace}/api/document/{doc_id}"
-        
+
         # Prepare files for multipart upload
         files = []
         try:
+            payload_bytes = 0
+
             for image_file in image_files:
                 if not os.path.exists(image_file):
                     self.logger.warning(f"File not found, skipping: {image_file}")
                     continue
-                
+
                 filename = os.path.basename(image_file)
                 content_type = self._guess_mime_type(image_file)
+                size_bytes = self._file_size_bytes(image_file)
+                payload_bytes += size_bytes
+
+                self.logger.debug(f"Payload file: {filename} ({_format_size(size_bytes)})")
                 files.append(('files', (filename, open(image_file, 'rb'), content_type)))
             
             if not files:
@@ -386,6 +728,10 @@ class Uploader:
             if self.config.api_token:
                 headers['Authorization'] = f'Bearer {self.config.api_token}'
             
+            self.logger.info(
+                f"Uploading payload: {len(files)} file(s), {_format_size(payload_bytes)} -> {api_url}"
+            )
+
             # Make request
             response = requests.post(  # type: ignore
                 api_url,

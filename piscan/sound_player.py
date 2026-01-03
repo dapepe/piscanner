@@ -4,26 +4,7 @@ import os
 import subprocess
 from typing import Optional
 
-try:
-    from .logger import Logger
-except ImportError:
-    # Simple logger fallback
-    import os
-    _debug_enabled = os.environ.get('PISCAN_DEBUG', '').lower() in ('1', 'true', 'yes')
-    
-    class Logger:
-        def info(self, msg, *args):
-            if _debug_enabled:
-                print(f"INFO: {msg % args if args else msg}")
-        def error(self, msg, *args):
-            if _debug_enabled:
-                print(f"ERROR: {msg % args if args else msg}")
-        def debug(self, msg, *args):
-            if _debug_enabled:
-                print(f"DEBUG: {msg % args if args else msg}")
-        def warning(self, msg, *args):
-            if _debug_enabled:
-                print(f"WARNING: {msg % args if args else msg}")
+from .logger import Logger as PiScanLogger
 
 
 class SoundPlayer:
@@ -36,7 +17,7 @@ class SoundPlayer:
             config: Configuration object
         """
         self.config = config
-        self.logger = Logger()
+        self.logger = PiScanLogger()
         self.enabled = config.sound_enabled
         # Some service runners (e.g. scanbd) may kill child processes when the
         # action script exits. Allow forcing blocking playback via env var.

@@ -169,37 +169,42 @@ class ScanManager:
             # Create scan directory
             scan_dir = self.file_manager.create_scan_directory()
 
-            # ZIP upload mode: scan all pages first, then upload one ZIP.
+            # ZIP upload mode: scan with per-page processing, then upload.
             if upload and self.config.upload_compression == 'zip':
-                self.logger.info("ZIP upload enabled; scanning all pages before upload")
+                self.logger.info("ZIP upload enabled; scanning with per-page processing")
 
-                scanned_files = self.scanner.scan_pages(scan_dir, source, page_callback=None)
+                processed_files = []
+                skipped_count = [0]
 
-                # Skip blank pages if configured
-                if self.config.skip_blank:
-                    kept_files = []
-                    blank_files = []
-                    for filepath in scanned_files:
-                        try:
+                def zip_page_callback(page_num, filepath):
+                    """Process each page as it's scanned."""
+                    try:
+                        # Color correction is applied by scanner during scan
+                        
+                        # Skip blank pages if configured
+                        if self.config.skip_blank:
                             if self.blank_detector.is_blank(filepath):
-                                blank_files.append(filepath)
-                            else:
-                                kept_files.append(filepath)
-                        except Exception as e:
-                            self.logger.warning(f"Blank detection failed for {filepath}: {e}")
-                            kept_files.append(filepath)
+                                self.logger.info(f"Page {page_num} is blank, removing")
+                                self.blank_detector.remove_blank_files([filepath])
+                                skipped_count[0] += 1
+                                return
+                        
+                        processed_files.append(filepath)
+                        self.logger.debug(f"Page {page_num} ready for ZIP: {filepath}")
+                    except Exception as e:
+                        self.logger.warning(f"Page processing error for {page_num}: {e}")
+                        processed_files.append(filepath)
 
-                    if blank_files:
-                        self.logger.info(f"Removing {len(blank_files)} blank page(s)")
-                        self.blank_detector.remove_blank_files(blank_files)
+                scanned_files = self.scanner.scan_pages(scan_dir, source, page_callback=zip_page_callback)
 
-                    scanned_files = kept_files
+                if skipped_count[0] > 0:
+                    self.logger.info(f"Skipped {skipped_count[0]} blank page(s)")
 
-                if not scanned_files:
+                if not processed_files:
                     raise Exception("No pages were scanned")
 
                 upload_result = self.uploader.upload_document(
-                    scanned_files,
+                    processed_files,
                     doc_id=doc_id,
                     metadata=metadata,
                     document_type=document_type,

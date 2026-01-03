@@ -6,26 +6,7 @@ import re
 from typing import List, Optional, Tuple
 from PIL import Image
 
-try:
-    from .logger import Logger
-except ImportError:
-    # Simple logger fallback - silent unless debug enabled
-    import os
-    _debug_enabled = os.environ.get('PISCAN_DEBUG', '').lower() in ('1', 'true', 'yes')
-    
-    class Logger:
-        def info(self, msg, *args):
-            if _debug_enabled:
-                print(f"INFO: {msg % args if args else msg}")
-        def error(self, msg, *args):
-            if _debug_enabled:
-                print(f"ERROR: {msg % args if args else msg}")
-        def debug(self, msg, *args):
-            if _debug_enabled:
-                print(f"DEBUG: {msg % args if args else msg}")
-        def warning(self, msg, *args):
-            if _debug_enabled:
-                print(f"WARNING: {msg % args if args else msg}")
+from .logger import Logger as PiScanLogger
 
 
 class Scanner:
@@ -39,7 +20,7 @@ class Scanner:
             uploader: Optional uploader instance for error logging
         """
         self.config = config
-        self.logger = Logger()
+        self.logger = PiScanLogger()
         self.device = self._get_device()
         self.uploader = uploader
     
@@ -117,6 +98,8 @@ class Scanner:
                 if file_ext in ['jpg', 'jpeg']:
                     save_kwargs['quality'] = image_quality
                     save_kwargs['optimize'] = True
+                    save_kwargs['progressive'] = True
+                    save_kwargs['subsampling'] = 2
                 elif file_ext == 'png' and optimize_png:
                     save_kwargs['optimize'] = True
                 
@@ -200,97 +183,89 @@ class Scanner:
         self.logger.debug(f"Scan command: {' '.join(cmd)}")
         
         try:
-            # If callback provided, monitor for pages in real-time
-            if page_callback:
-                import threading
-                import time
-                
-                scan_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                scanned_files = []
-                seen_files = set()
-                
-                def monitor_pages():
-                    """Monitor directory for new page files."""
-                    page_num = 0
-                    while scan_process.poll() is None:
-                        time.sleep(0.3)  # Check every 300ms
-                        try:
-                            for filename in sorted(os.listdir(output_dir)):
-                                pattern = f"page_.*\\.{format_ext}$"
-                                if re.match(pattern, filename):
-                                    filepath = os.path.join(output_dir, filename)
-                                    if filepath not in seen_files:
-                                        # Wait briefly to ensure file is fully written
-                                        time.sleep(0.2)
-                                        seen_files.add(filepath)
-                                        
-                                        # Apply color correction if configured
-                                        self._apply_color_correction(filepath)
-                                        
-                                        scanned_files.append(filepath)
-                                        page_num += 1
-                                        self.logger.debug(f"Page {page_num} ready: {filepath}")
-                                        try:
-                                            page_callback(page_num, filepath)
-                                        except Exception as e:
-                                            self.logger.error(f"Callback error: {e}")
-                        except Exception as e:
-                            self.logger.warning(f"Error monitoring pages: {e}")
-                
-                monitor_thread = threading.Thread(target=monitor_pages, daemon=True)
-                monitor_thread.start()
-                
-                # Wait for scan to complete
-                stdout, stderr = scan_process.communicate(timeout=300)
-                monitor_thread.join(timeout=2)
+            # Always monitor output_dir while scanimage runs.
+            # This allows per-page post-processing (color correction/optimization)
+            # even when callers want to upload at the end (ZIP mode).
+            import threading
+            import time
 
-                # Final sweep: scanimage can exit quickly and still leave page files.
-                # Make sure we don't miss the last page(s) before evaluating errors.
-                try:
-                    pattern = f"page_.*\\.{format_ext}$"
-                    for filename in sorted(os.listdir(output_dir)):
-                        if re.match(pattern, filename):
-                            filepath = os.path.join(output_dir, filename)
-                            if filepath not in seen_files:
-                                seen_files.add(filepath)
-                                self._apply_color_correction(filepath)
-                                scanned_files.append(filepath)
-                                page_num = len(scanned_files)
-                                self.logger.debug(f"Page {page_num} ready (final sweep): {filepath}")
-                                if page_callback:
-                                    try:
-                                        page_callback(page_num, filepath)
-                                    except Exception as e:
-                                        self.logger.error(f"Callback error (final sweep): {e}")
-                except Exception as e:
-                    self.logger.warning(f"Error during final page sweep: {e}")
-                
-                # Build result object
-                returncode = scan_process.returncode
-                output_text = (stdout + stderr).lower()
-            else:
-                # Original synchronous behavior
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                stdout = result.stdout
-                stderr = result.stderr
-                returncode = result.returncode
-                output_text = (stdout + stderr).lower()
-                scanned_files = []  # Will be populated below
-            
-            # Find scanned files (only needed if no callback was used)
-            if not page_callback:
-                # Note: scanimage uses 'jpg' extension for jpeg format
-                format_ext = 'jpg' if self.config.scanner_format == 'jpeg' else self.config.scanner_format
-                pattern = f"page_.*\\.{format_ext}$"
-                for filename in os.listdir(output_dir):
-                    if re.match(pattern, filename):
-                        scanned_files.append(os.path.join(output_dir, filename))
-                
-                scanned_files.sort()  # Ensure proper order
-                
-                # Apply color correction to all scanned files
-                for filepath in scanned_files:
-                    self._apply_color_correction(filepath)
+            scan_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            scanned_files: List[str] = []
+            seen_files = set()
+            pattern = re.compile(f"page_.*\\.{re.escape(format_ext)}$")
+
+            def wait_for_file_complete(path: str, timeout_s: float = 10.0) -> None:
+                """Wait until the scanned file is fully written."""
+                start = time.time()
+                last_size = -1
+                stable_rounds = 0
+
+                while time.time() - start < timeout_s:
+                    try:
+                        size = os.path.getsize(path)
+                    except OSError:
+                        time.sleep(0.1)
+                        continue
+
+                    if size > 0 and size == last_size:
+                        stable_rounds += 1
+                        if stable_rounds >= 2:
+                            return
+                    else:
+                        stable_rounds = 0
+                        last_size = size
+
+                    time.sleep(0.1)
+
+            def handle_new_file(filepath: str) -> None:
+                if filepath in seen_files:
+                    return
+
+                seen_files.add(filepath)
+                wait_for_file_complete(filepath)
+
+                # Apply per-page post-processing right away
+                self._apply_color_correction(filepath)
+
+                scanned_files.append(filepath)
+                page_num = len(scanned_files)
+                self.logger.debug(f"Page {page_num} ready: {filepath}")
+
+                if page_callback:
+                    try:
+                        page_callback(page_num, filepath)
+                    except Exception as e:
+                        self.logger.error(f"Callback error: {e}")
+
+            def monitor_pages() -> None:
+                """Monitor directory for new page files."""
+                while scan_process.poll() is None:
+                    time.sleep(0.3)  # Check every 300ms
+                    try:
+                        for filename in sorted(os.listdir(output_dir)):
+                            if pattern.match(filename):
+                                handle_new_file(os.path.join(output_dir, filename))
+                    except Exception as e:
+                        self.logger.warning(f"Error monitoring pages: {e}")
+
+            monitor_thread = threading.Thread(target=monitor_pages, daemon=True)
+            monitor_thread.start()
+
+            # Wait for scan to complete
+            stdout, stderr = scan_process.communicate(timeout=300)
+            monitor_thread.join(timeout=2)
+
+            # Final sweep: scanimage can exit quickly and still leave page files.
+            # Make sure we don't miss the last page(s) before evaluating errors.
+            try:
+                for filename in sorted(os.listdir(output_dir)):
+                    if pattern.match(filename):
+                        handle_new_file(os.path.join(output_dir, filename))
+            except Exception as e:
+                self.logger.warning(f"Error during final page sweep: {e}")
+
+            returncode = scan_process.returncode
+            output_text = (stdout + stderr).lower()
 
             feeder_out = (
                 "document feeder out of documents" in output_text
@@ -402,6 +377,14 @@ class Scanner:
         Returns:
             Scanner-specific source name
         """
+        # Optimization: If source is specific (not a generic category we need to map),
+        # skip the expensive scanimage -A check. This prevents timeouts when the
+        # scanner is busy (e.g. triggered by button press via scanbd).
+        # We assume specific names provided in config are correct.
+        source_upper = source.upper()
+        if source_upper not in ["AUTO", "ADF", "FLATBED"]:
+            return source
+
         # Get scanner's available sources
         try:
             result = subprocess.run([

@@ -56,7 +56,13 @@ class Config:
         "upload": {
             "compression": "individual",  # individual, zip
             "image_quality": 90,  # JPEG quality (1-100)
-            "optimize_png": True  # Optimize PNG files
+            "optimize_png": True,  # Optimize PNG files
+            "zip_bundle_size": 0,  # Max files per ZIP bundle (0 = unlimited)
+            "zip_bundle_max_bytes": 0,  # Max ZIP payload bytes per bundle (0 = unlimited)
+            "zip_compression_level": 6,  # ZIP compression level (1-9, 9 = best compression)
+            "auto_jpeg_threshold": 0,  # Auto-convert to JPEG if page count exceeds this (0 = disabled)
+            "auto_jpeg_page_size_bytes": 0,  # Auto-convert large pages to JPEG (0 = disabled)
+            "max_image_dimension": 0  # Max dimension for images (0 = unlimited, reduces size for large docs)
         }
     }
     
@@ -323,3 +329,33 @@ class Config:
     def upload_optimize_png(self) -> bool:
         """Whether to optimize PNG files."""
         return self.get('upload.optimize_png', True)
+
+    @property
+    def upload_zip_bundle_size(self) -> int:
+        """Get max files per ZIP bundle (0 = unlimited)."""
+        return int(self.get('upload.zip_bundle_size', 0))
+
+    @property
+    def upload_zip_bundle_max_bytes(self) -> int:
+        """Max ZIP payload bytes per bundle (0 = unlimited)."""
+        return int(self.get('upload.zip_bundle_max_bytes', 0))
+
+    @property
+    def upload_zip_compression_level(self) -> int:
+        """Get ZIP compression level (1-9, 9 = best)."""
+        return self.get('upload.zip_compression_level', 6)
+
+    @property
+    def upload_auto_jpeg_threshold(self) -> int:
+        """Get auto-JPEG conversion threshold (0 = disabled)."""
+        return int(self.get('upload.auto_jpeg_threshold', 0))
+
+    @property
+    def upload_auto_jpeg_page_size_bytes(self) -> int:
+        """Auto-convert large pages to JPEG (0 = disabled)."""
+        return int(self.get('upload.auto_jpeg_page_size_bytes', 0))
+
+    @property
+    def upload_max_image_dimension(self) -> int:
+        """Get max image dimension (0 = unlimited)."""
+        return self.get('upload.max_image_dimension', 0)
