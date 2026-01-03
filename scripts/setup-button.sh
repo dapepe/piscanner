@@ -271,11 +271,11 @@ fi
 
 # Run scan script (includes ZIP bundling + payload size logs)
 # --debug prints key config (no secrets) into the scanbd log.
+# -u forces unbuffered binary stdout/stderr so logs appear in real-time.
+# We redirect directly to LOG_FILE to avoid bash buffering loop delays.
 set +e
-"$PYTHON_BIN" "$SCAN_SCRIPT" --config "$CONFIG_PATH" --debug 2>&1 | while IFS= read -r line; do
-  log "$line"
-done
-rc=${PIPESTATUS[0]}
+"$PYTHON_BIN" -u "$SCAN_SCRIPT" --config "$CONFIG_PATH" --debug >> "$LOG_FILE" 2>&1
+rc=$?
 set -e
 
 if [ "$rc" -eq 0 ]; then
@@ -328,8 +328,8 @@ if [ "$CONFIGURE_SCANBD" = true ]; then
     # Example: "canon_dr:libusb:003:002" -> "canon_dr"
     SCANBD_BACKEND="$(echo "${SCANNER_DEVICE:-}" | head -n1 | cut -d':' -f1)"
     
-    # Fallback if empty
-    if [ -z "$SCANBD_BACKEND" ]; then
+    # Fallback if empty or if it looks like a network prefix (which scanbd can't use for itself)
+    if [ -z "$SCANBD_BACKEND" ] || [ "$SCANBD_BACKEND" = "net" ] || [ "$SCANBD_BACKEND" = "airscan" ]; then
          SCANBD_BACKEND="canon_dr"
     fi
 
@@ -345,12 +345,17 @@ device piscan {
     filter = "^${SCANBD_BACKEND}.*"  # backend prefix (regex)
     desc   = "Piscan button trigger"
 
-    # Canon DR-series commonly exposes button options like:
-    # start, stop, button-1, button-2, button-3
-    # We trigger on any change in these options.
-    action scan {
-        filter = "^(start|button-[0-9]+|scan)$"
-        desc   = "Scan to piscan"
+    # Trigger on Start button (green/main)
+    action scan_start {
+        filter = "^start$"
+        desc   = "Scan to piscan (start)"
+        script = "/etc/scanbd/scan.sh"
+    }
+
+    # Trigger on extra function buttons (often labelled 1/2/3)
+    action scan_button {
+        filter = "^button-.*"
+        desc   = "Scan to piscan (function button)"
         script = "/etc/scanbd/scan.sh"
     }
 }
@@ -363,7 +368,7 @@ EOF
 # Keep debug enabled for initial setup; lower later if desired.
 global {
     debug   = true
-    debug-level = 7
+    debug-level = 3
 
     user    = saned
     group   = scanner
@@ -402,6 +407,28 @@ EOF
 
     print_success "Updated /etc/scanbd/scanbd.conf"
     print_success "Created /etc/scanbd/scanner.d/piscan.conf (backend: $SCANBD_BACKEND)"
+
+    # --- Fix: Configure scanbd's private SANE backend ---
+    print_info "Configuring scanbd private backends..."
+    
+    # Write only the real backend to scanbd's dll.conf
+    cat > /etc/scanbd/sane.d/dll.conf << EOF
+# Piscan: scanbd uses real backends directly
+$SCANBD_BACKEND
+
+# Do NOT use net backend here - that's for normal applications
+EOF
+    print_success "Updated /etc/scanbd/sane.d/dll.conf with '$SCANBD_BACKEND'"
+
+    # Configure environment for scanbd service to use this private config
+    if grep -q "SANE_CONFIG_DIR" /etc/default/scanbd 2>/dev/null; then
+        sed -i 's|^.*SANE_CONFIG_DIR=.*|export SANE_CONFIG_DIR=/etc/scanbd/sane.d|' /etc/default/scanbd
+    else
+        echo 'export SANE_CONFIG_DIR=/etc/scanbd/sane.d' >> /etc/default/scanbd
+    fi
+    print_success "Updated /etc/default/scanbd"
+    # ----------------------------------------------------
+
 else
     print_info "Skipped scanbd.conf update"
 fi
@@ -431,7 +458,9 @@ if ask_yes_no "Run button detection test?"; then
     echo ""
     
     # Run scanbd in foreground with timeout
-    timeout 30s scanbd -f -d7 2>&1 | tee /tmp/scanbd-test.log || true
+    # IMPORTANT: We must explicitly set SANE_CONFIG_DIR for the test command,
+    # because it doesn't read /etc/default/scanbd when run manually!
+    timeout 30s env SANE_CONFIG_DIR=/etc/scanbd/sane.d scanbd -f -d7 -c /etc/scanbd/scanbd.conf 2>&1 | tee /tmp/scanbd-test.log || true
     
     echo ""
     if grep -qi "scan" /tmp/scanbd-test.log; then
