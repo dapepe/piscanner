@@ -29,7 +29,7 @@ upload:
   compression: "individual"  # Compression mode: "individual" (upload as separate files), "zip" (compress to ZIP before upload)
   image_quality: 90  # JPEG quality for compression (1-100, higher = better quality but larger file)
   optimize_png: true  # Optimize PNG files to reduce size
-  zip_bundle_size: 50  # Max files per ZIP bundle (0 = unlimited). Splits large documents into multiple ZIPs
+  zip_bundle_size: 6  # Max files per ZIP bundle (0 = unlimited). Splits large documents into multiple ZIPs (default: 6 pages)
   zip_bundle_max_bytes: 0  # Max ZIP payload bytes per bundle (0 = unlimited). Useful to avoid HTTP 413 (e.g. 50000000 for ~50MB)
   zip_compression_level: 6  # ZIP compression level (1-9, 9 = best compression but slower)
   auto_jpeg_threshold: 0  # Auto-convert to JPEG if page count exceeds this (0 = disabled). JPEG compresses better than PNG for photos

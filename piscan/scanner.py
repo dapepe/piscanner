@@ -9,6 +9,16 @@ from PIL import Image
 from .logger import Logger as PiScanLogger
 
 
+def _format_size(size_bytes: int) -> str:
+    """Format byte size to human-readable string."""
+    size = float(size_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 class Scanner:
     """Scanner interface using SANE scanimage utility."""
     
@@ -26,7 +36,7 @@ class Scanner:
     
     def _apply_color_correction(self, file_path: str, source: Optional[str] = None) -> None:
         """Apply color correction and optimization to scanned image.
-        
+
         Args:
             file_path: Path to image file to correct
             source: Source used for scanning (optional, for mirror logic)
@@ -35,7 +45,7 @@ class Scanner:
         optimize_png = self.config.upload_optimize_png
         image_quality = self.config.upload_image_quality
         mirror_simplex = self.config.scanner_mirror_simplex
-        
+
         # Check if mirror logic is needed
         should_mirror = False
         if mirror_simplex and source and "front" in source.lower():
@@ -44,18 +54,30 @@ class Scanner:
         # Skip if no correction needed and no optimization
         if (correction_mode == "none" or not correction_mode) and not optimize_png and not should_mirror:
             return
-        
+
         try:
             # Open image
             img = Image.open(file_path)
             needs_save = False
 
+            # Log initial image details
+            file_size = os.path.getsize(file_path)
+            file_ext = os.path.splitext(file_path)[1].lower()[1:]
+            width, height = img.size
+
+            self.logger.info(
+                f"Scanned page: {os.path.basename(file_path)} | "
+                f"Format: {file_ext.upper()} | Mode: {img.mode} | "
+                f"Size: {width}x{height} | File: {_format_size(file_size)} | "
+                f"Color correction: {correction_mode or 'none'}"
+            )
+
             # Apply mirror flip if requested for simplex
             if should_mirror:
-                img = img.transpose(0)  # 0 = Image.FLIP_LEFT_RIGHT
-                self.logger.debug(f"Applied mirror correction to {file_path}")
+                img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                self.logger.info(f"Applied mirror correction to {file_path}")
                 needs_save = True
-            
+
             # Apply color correction to color images
             if correction_mode and correction_mode != "none" and img.mode in ('RGB', 'RGBA'):
                 # Split channels
@@ -65,60 +87,64 @@ class Scanner:
                 else:
                     r, g, b = img.split()
                     a = None
-                
+
                 # Apply correction based on mode
                 if correction_mode == "swap_rb" or correction_mode == "bgr_to_rgb":
                     # Swap red and blue channels (BGR -> RGB or RGB -> BGR)
                     corrected_channels = (b, g, r)
-                    self.logger.debug(f"Applied swap_rb correction to {file_path}")
+                    self.logger.info(f"Applied swap_rb correction to {file_path}")
                     needs_save = True
                 elif correction_mode == "swap_rg":
                     # Swap red and green channels
                     corrected_channels = (g, r, b)
-                    self.logger.debug(f"Applied swap_rg correction to {file_path}")
+                    self.logger.info(f"Applied swap_rg correction to {file_path}")
                     needs_save = True
                 elif correction_mode == "swap_gb":
                     # Swap green and blue channels
                     corrected_channels = (r, b, g)
-                    self.logger.debug(f"Applied swap_gb correction to {file_path}")
+                    self.logger.info(f"Applied swap_gb correction to {file_path}")
                     needs_save = True
                 elif correction_mode == "rotate_left":
                     # Rotate channels left: RGB -> GBR
                     corrected_channels = (g, b, r)
-                    self.logger.debug(f"Applied rotate_left correction to {file_path}")
+                    self.logger.info(f"Applied rotate_left correction to {file_path}")
                     needs_save = True
                 elif correction_mode == "rotate_right":
                     # Rotate channels right: RGB -> BRG
                     corrected_channels = (b, r, g)
-                    self.logger.debug(f"Applied rotate_right correction to {file_path}")
+                    self.logger.info(f"Applied rotate_right correction to {file_path}")
                     needs_save = True
                 else:
                     self.logger.warning(f"Unknown color correction mode: {correction_mode}")
                     corrected_channels = None
-                
+
                 # Merge channels back
                 if corrected_channels:
                     if has_alpha and a is not None:
                         img = Image.merge('RGBA', corrected_channels + (a,))
                     else:
                         img = Image.merge('RGB', corrected_channels)
-            
+
             # Save with optimization if needed
             if needs_save or optimize_png:
                 file_ext = file_path.lower().split('.')[-1]
                 save_kwargs = {}
-                
+
                 if file_ext in ['jpg', 'jpeg']:
                     save_kwargs['quality'] = image_quality
                     save_kwargs['optimize'] = True
                     save_kwargs['progressive'] = True
                     save_kwargs['subsampling'] = 2
+                    self.logger.info(f"JPEG save settings: quality={image_quality}, optimize=True, progressive=True, subsampling=2")
                 elif file_ext == 'png' and optimize_png:
                     save_kwargs['optimize'] = True
-                
+                    self.logger.info(f"PNG save settings: optimize=True")
+
                 img.save(file_path, **save_kwargs)
-                self.logger.debug(f"Image post-processing saved to {file_path}")
-            
+                new_size = os.path.getsize(file_path)
+                if new_size != file_size:
+                    self.logger.info(f"Saved post-processed image: {_format_size(new_size)}")
+
         except Exception as e:
             self.logger.error(f"Failed to apply post-processing to {file_path}: {e}")
     
@@ -196,10 +222,9 @@ class Scanner:
         if paper_size:
             ps = paper_size.upper()
             if ps == "A4":
-                # Use slightly larger height (300mm) to ensure full page is captured
-                # as some scanners cut off the bottom margin.
+                # Standard A4 height (297mm)
                 # Also set page-width/height explicitly for drivers that require it.
-                cmd.extend(['--page-width', '210', '--page-height', '300', '-x', '210', '-y', '300'])
+                cmd.extend(['--page-width', '210', '--page-height', '297', '-x', '210', '-y', '297'])
             elif ps == "LETTER":
                 cmd.extend(['--page-width', '215.9', '--page-height', '279.4', '-x', '215.9', '-y', '279.4'])
             elif ps == "LEGAL":

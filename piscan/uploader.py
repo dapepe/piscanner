@@ -108,11 +108,11 @@ class Uploader:
     
     def _compress_to_zip(self, image_files: List[str], compression_level: int = 6) -> str:
         """Compress image files to a ZIP archive.
-        
+
         Args:
             image_files: List of image file paths
             compression_level: ZIP compression level (1-9)
-            
+
         Returns:
             Path to created ZIP file
         """
@@ -122,19 +122,30 @@ class Uploader:
         temp_zip = tempfile.NamedTemporaryFile(mode='w+b', suffix='.zip', delete=False)
         zip_path = temp_zip.name
         temp_zip.close()
-        
+
         try:
+            self.logger.info(f"Creating ZIP with compression level {compression_level} for {len(image_files)} files")
+
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=compression_level) as zipf:
-                for image_file in image_files:
+                for idx, image_file in enumerate(image_files, 1):
                     if os.path.exists(image_file):
                         arcname = os.path.basename(image_file)
+                        file_size = self._file_size_bytes(image_file)
+                        file_ext = os.path.splitext(image_file.lower())[1][1:]
+                        
+                        self.logger.info(
+                            f"Page {idx}/{len(image_files)}: {arcname} | "
+                            f"Format: {file_ext.upper()} | "
+                            f"Size: {_format_size(file_size)} | "
+                            f"ZIP compression: level {compression_level}"
+                        )
+                        
                         zipf.write(image_file, arcname=arcname)
-                        self.logger.debug(f"Added {arcname} to ZIP")
-            
+
             total_size = os.path.getsize(zip_path)
             self.logger.info(f"Created ZIP: {zip_path} ({len(image_files)} files, {_format_size(total_size)})")
             return zip_path
-            
+
         except Exception as e:
             if os.path.exists(zip_path):
                 os.remove(zip_path)
@@ -142,61 +153,70 @@ class Uploader:
     
     def _optimize_image(self, file_path: str) -> Optional[str]:
         """Optimize image for size reduction.
-        
+
         Args:
             file_path: Path to image file
-            
+
         Returns:
             Path to optimized file (same as input if no changes made)
         """
         max_dim = self.config.upload_max_image_dimension
         if max_dim <= 0:
             return file_path
-        
+
         try:
             img = Image.open(file_path)
             width, height = img.size
-            
+            file_ext = os.path.splitext(file_path.lower())[1][1:]
+            quality = self.config.upload_image_quality
+
             if width <= max_dim and height <= max_dim:
                 return file_path
-            
+
             ratio = min(max_dim / width, max_dim / height)
             new_width = int(width * ratio)
             new_height = int(height * ratio)
-            
-            self.logger.debug(f"Resizing {file_path} from {width}x{height} to {new_width}x{new_height}")
-            
+
+            self.logger.info(
+                f"Optimizing {os.path.basename(file_path)}: {width}x{height} -> {new_width}x{new_height} | "
+                f"Format: {file_ext.upper()} | Quality: {quality}"
+            )
+
             img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-            file_ext = os.path.splitext(file_path.lower())[1]
             save_kwargs: Dict[str, Any] = {'optimize': True}
             if file_ext in ('.jpg', '.jpeg'):
                 save_kwargs.update({
-                    'quality': self.config.upload_image_quality,
+                    'quality': quality,
                     'progressive': True,
                     'subsampling': 2,
                 })
+                self.logger.info(f"JPEG settings: quality={quality}, progressive=True, subsampling=2")
 
             img.save(file_path, **save_kwargs)
-            
+
             return file_path
-            
+
         except Exception as e:
             self.logger.warning(f"Failed to optimize {file_path}: {e}")
             return file_path
     
     def _convert_to_jpeg(self, file_path: str) -> Optional[str]:
         """Convert image to JPEG for better compression.
-        
+
         Args:
             file_path: Path to image file
-            
+
         Returns:
             Path to JPEG file (same name but .jpg extension)
         """
         try:
             img = Image.open(file_path)
-            
+            original_mode = img.mode
+            original_size = img.size
+            original_ext = os.path.splitext(file_path.lower())[1][1:]
+            quality = self.config.upload_image_quality
+
             if img.mode in ('RGBA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 if img.mode == 'P':
@@ -205,23 +225,28 @@ class Uploader:
                 img = background
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
-            
+
             jpeg_path = os.path.splitext(file_path)[0] + '.jpg'
+
+            self.logger.info(
+                f"Converting {os.path.basename(file_path)} to JPEG: {original_ext.upper()}({original_mode}) -> JPG(RGB) | "
+                f"Size: {original_size[0]}x{original_size[1]} | Quality: {quality}"
+            )
+            self.logger.info(f"JPEG settings: quality={quality}, optimize=True, progressive=True, subsampling=2")
+
             img.save(
                 jpeg_path,
-                quality=self.config.upload_image_quality,
+                quality=quality,
                 optimize=True,
                 progressive=True,
                 subsampling=2,
             )
-            
-            self.logger.debug(f"Converted {file_path} to {jpeg_path}")
-            
+
             if file_path != jpeg_path and os.path.exists(file_path):
                 os.remove(file_path)
-            
+
             return jpeg_path
-            
+
         except Exception as e:
             self.logger.warning(f"Failed to convert {file_path} to JPEG: {e}")
             return file_path
@@ -372,7 +397,7 @@ class Uploader:
         auto_jpeg_page_size_bytes: int = 0,
     ) -> Dict[str, Any]:
         """Upload files as a single ZIP archive."""
-        self.logger.info(f"Creating ZIP archive for {len(image_files)} pages")
+        self.logger.info(f"Creating single ZIP archive for {len(image_files)} pages")
 
         optimized_files: List[str] = []
         try:
@@ -388,6 +413,7 @@ class Uploader:
                 )
 
             compression_level = self.config.upload_zip_compression_level
+            self.logger.info(f"ZIP compression level: {compression_level}")
             zip_path = self._compress_to_zip(optimized_files, compression_level)
 
             zip_size = self._file_size_bytes(zip_path)
@@ -440,7 +466,11 @@ class Uploader:
             limits.append(f"{_format_size(bundle_max_bytes)}")
         limits_str = ", ".join(limits) if limits else "unlimited"
 
-        self.logger.info(f"ZIP bundling enabled ({limits_str}) for {total_pages} page(s)")
+        compression_level = self.config.upload_zip_compression_level
+        self.logger.info(
+            f"ZIP bundling: {limits_str} per bundle | Compression level: {compression_level} | "
+            f"Total pages: {total_pages}"
+        )
 
         prepared_files: List[str] = []
         for filepath in image_files:
@@ -454,14 +484,13 @@ class Uploader:
             )
 
         bundles = self._build_zip_bundles(prepared_files, bundle_size=bundle_size, bundle_max_bytes=bundle_max_bytes)
-        compression_level = self.config.upload_zip_compression_level
 
         created_doc_id: Optional[str] = None
         total_pages_uploaded = 0
         bundle_payload_bytes: List[int] = []
 
         for bundle_num, bundle_files in enumerate(bundles, start=1):
-            self.logger.info(f"Processing bundle {bundle_num}/{len(bundles)} ({len(bundle_files)} pages)")
+            self.logger.info(f"Bundle {bundle_num}/{len(bundles)}: {len(bundle_files)} pages")
 
             zip_path = self._compress_to_zip(bundle_files, compression_level)
             zip_size = self._file_size_bytes(zip_path)

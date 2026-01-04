@@ -61,7 +61,7 @@ class Config:
             "compression": "individual",  # individual, zip
             "image_quality": 90,  # JPEG quality (1-100)
             "optimize_png": True,  # Optimize PNG files
-            "zip_bundle_size": 0,  # Max files per ZIP bundle (0 = unlimited)
+            "zip_bundle_size": 6,  # Max files per ZIP bundle (0 = unlimited)
             "zip_bundle_max_bytes": 0,  # Max ZIP payload bytes per bundle (0 = unlimited)
             "zip_compression_level": 6,  # ZIP compression level (1-9, 9 = best compression)
             "auto_jpeg_threshold": 0,  # Auto-convert to JPEG if page count exceeds this (0 = disabled)
