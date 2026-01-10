@@ -1,0 +1,3 @@
+#!/bin/bash
+# Test script for button detection
+logger -t "scanbd-test" "Button detected: action=$SCANBD_ACTION device=$SCANBD_DEVICE"

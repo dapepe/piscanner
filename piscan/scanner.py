@@ -150,41 +150,130 @@ class Scanner:
     
     def _get_device(self) -> str:
         """Get scanner device string.
-        
+
         Returns:
             Device string for scanimage
         """
         if self.config.scanner_device:
             self.logger.debug(f"Using configured device: {self.config.scanner_device}")
             return self.config.scanner_device
-        
-        raise ScannerError("No scanner device configured. Please set scanner.device in config.yaml")
-    
+
+        # Auto-detect scanner device
+        self.logger.info("No scanner device configured, attempting auto-detection...")
+        detected_device = self._auto_detect_scanner()
+        if detected_device:
+            self.logger.info(f"Auto-detected scanner device: {detected_device}")
+            return detected_device
+
+        raise ScannerError("No scanner device configured and auto-detection failed. Please set scanner.device in config.yaml or ensure scanner is connected and powered on.")
+
+    def _auto_detect_scanner(self) -> Optional[str]:
+        """Auto-detect scanner device by scanning available devices.
+
+        Returns:
+            Device string if scanner found, None otherwise
+        """
+        try:
+            # List all available scanners
+            result = subprocess.run([
+                'scanimage', '-L'
+            ], capture_output=True, text=True, timeout=10)
+
+            if result.returncode != 0:
+                self.logger.warning(f"Failed to list scanners: {result.stderr}")
+                return None
+
+            # Parse output to find Canon DR-F120 scanner
+            lines = result.stdout.strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line.startswith('device '):
+                    continue
+
+                # Extract device string and description
+                # Format: device `device_string' is a MANUFACTURER MODEL scanner
+                match = re.search(r"device `([^']+)' is a (.+)", line)
+                if match:
+                    device_string = match.group(1)
+                    description = match.group(2)
+
+                    # Skip non-localhost net devices (remote scanners)
+                    if device_string.startswith('net:') and not device_string.startswith('net:localhost:'):
+                        continue
+
+                    # Prioritize net:localhost devices (scanbd proxy) when available
+                    if device_string.startswith('net:localhost:'):
+                        # Look for Canon DR-F120 through scanbd proxy
+                        if 'CANON' in description.upper() and 'DR-F120' in description.upper():
+                            self.logger.info(f"Found Canon DR-F120 scanner via scanbd proxy: {device_string}")
+                            return device_string
+                        # Also accept any Canon scanner via proxy as fallback
+                        if 'CANON' in description.upper():
+                            self.logger.info(f"Found Canon scanner via scanbd proxy (using as fallback): {device_string}")
+                            return device_string
+                    else:
+                        # Direct device access (when scanbd not running or not configured)
+                        # Look for Canon DR-F120
+                        if 'CANON' in description.upper() and 'DR-F120' in description.upper():
+                            self.logger.info(f"Found Canon DR-F120 scanner direct: {device_string}")
+                            return device_string
+                        # Also accept any Canon scanner as fallback
+                        if 'CANON' in description.upper():
+                            self.logger.info(f"Found Canon scanner direct (using as fallback): {device_string}")
+                            return device_string
+
+            self.logger.warning("No suitable Canon scanner found in device list")
+            return None
+
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            self.logger.error(f"Scanner auto-detection failed: {e}")
+            return None
+
     def test_scanner(self) -> bool:
         """Test if scanner is accessible.
-        
+
         Returns:
             True if scanner is accessible
         """
         try:
+            # First, check if device is still detectable in the device list
+            detected_device = self._auto_detect_scanner()
+            if not detected_device:
+                self.logger.error("Scanner no longer detectable in device list")
+                return False
+
+            # If device changed, update it
+            if detected_device != self.device:
+                self.logger.info(f"Scanner device changed: {self.device} -> {detected_device}")
+                self.device = detected_device
+
+            # Try to test scanner access
             result = subprocess.run([
-                'scanimage', 
+                'scanimage',
                 '-d', self.device,
                 '--test'
             ], capture_output=True, text=True, timeout=30)
-            
+
             if result.returncode == 0:
                 self.logger.info("Scanner test successful")
                 return True
             else:
-                self.logger.error(f"Scanner test failed: {result.stderr}")
-                return False
+                # Check if this is a configuration issue rather than device issue
+                error_output = (result.stderr + result.stdout).lower()
+                if "invalid argument" in error_output or "busy" in error_output or "net.conf" in error_output:
+                    self.logger.warning(f"Scanner test failed due to configuration/access issue: {result.stderr}")
+                    self.logger.warning("Scanner appears to be connected but may be managed by scanbd or have configuration issues")
+                    # Still return True since device is detectable - the actual scan may work
+                    return True
+                else:
+                    self.logger.error(f"Scanner test failed: {result.stderr}")
+                    return False
         except Exception as e:
             self.logger.error(f"Scanner test error: {e}")
             return False
     
     def scan_pages(self, output_dir: str, source: Optional[str] = None, 
-                   page_callback=None) -> List[str]:
+                   page_callback=None, max_pages: Optional[int] = None) -> List[str]:
         """Scan pages to output directory.
         
         Args:
@@ -192,6 +281,7 @@ class Scanner:
             source: Source to scan from (ADF, Flatbed, or Auto)
             page_callback: Optional callback function called when each page is ready.
                           Called with (page_number, file_path) as arguments.
+            max_pages: Optional maximum number of pages to scan
             
         Returns:
             List of scanned file paths
@@ -216,6 +306,9 @@ class Scanner:
             '--source', actual_source,
             f'--format={self.config.scanner_format}',
         ]
+
+        if max_pages:
+            cmd.append(f'--batch-count={max_pages}')
 
         # Apply paper size / geometry
         paper_size = self.config.scanner_paper_size

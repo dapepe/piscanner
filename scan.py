@@ -26,7 +26,7 @@ def _format_size(size_bytes: int) -> str:
     return f"{size:.1f} TB"
 
 
-def scan_document(config, source=None, format_type=None, debug=False):
+def scan_document(config, source=None, format_type=None, debug=False, max_pages=None):
     """Scan a document and upload to API."""
     
     sound_player = None
@@ -41,6 +41,7 @@ def scan_document(config, source=None, format_type=None, debug=False):
     
     if debug:
         print(f"Scan directory: {scan_dir}")
+        print(f"Max pages: {max_pages}")
         print(f"Color correction: {config.scanner_color_correction}")
         print(f"Upload compression: {config.upload_compression}")
         print(f"ZIP bundle size: {config.upload_zip_bundle_size}")
@@ -122,6 +123,7 @@ def scan_document(config, source=None, format_type=None, debug=False):
             scan_dir,
             source=config.scanner_source,
             page_callback=page_callback,
+            max_pages=max_pages
         )
 
         if debug:
@@ -210,6 +212,7 @@ def main():
     parser.add_argument('--format', dest='format_type', help='Output format (jpeg, png, tiff)')
     parser.add_argument('--debug', action='store_true', help='Show debug information')
     parser.add_argument('--config', help='Path to config file (default: ./config/config.yaml)')
+    parser.add_argument('--pages', type=int, help='Maximum number of pages to scan')
     
     args = parser.parse_args()
     
@@ -219,7 +222,7 @@ def main():
         config = Config(config_path)
         
         # Run scan
-        scan_document(config, args.source, args.format_type, args.debug)
+        scan_document(config, args.source, args.format_type, args.debug, args.pages)
         
     except Exception as e:
         print(f"Error: {e}")
